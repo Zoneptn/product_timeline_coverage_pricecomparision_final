@@ -1,5 +1,5 @@
 """
-SAC Crop Dashboard — entry point
+Crop Dashboard — entry point
 ---------------------------------
 Sidebar switch between three independent views, each in its own module:
 
@@ -21,7 +21,7 @@ from threat_view import render_threat_view
 from coverage_view import render_coverage_view
 from price_view import render_price_comparison_view
 
-st.set_page_config(page_title="SAC Crop Dashboard", layout="wide")
+st.set_page_config(page_title="Crop Dashboard", layout="wide")
 
 st.sidebar.subheader("View")
 view = st.sidebar.radio(
