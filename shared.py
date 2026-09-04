@@ -128,6 +128,18 @@ EFFICIENCY_LEGEND = (
     "🔴 **Ineffective** <40% control"
 )
 
+# Numeric score for heatmap coloring (chemical_analysis_view.py) — higher
+# is better. 0 for Unrated/unknown so it renders distinctly gray rather
+# than being mistaken for a genuinely bad (Ineffective) rating.
+EFFICIENCY_SCORE = {
+    "Excellent": 5,
+    "Effective": 4,
+    "Moderate": 3,
+    "Poor": 2,
+    "Ineffective": 1,
+    "Unrated": 0,
+}
+
 
 # =====================================================================
 # Price formatting — used by Coverage boards and Price Comparison.

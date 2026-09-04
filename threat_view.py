@@ -23,9 +23,12 @@ company/brand dimension, just chemical-to-target links, unlike the
 Coverage workbook's per-product junction sheets. Entirely optional:
 omit the column, or leave individual cells blank, and it shows as
 "Unrated" rather than breaking anything — fill it in gradually.
+
+Note: this workbook also has 3 more sheets (weed_matrix / insect_matrix
+/ disease_matrix) used only by chemical_analysis_view.py, not by this
+file — see data_threat.py for details.
 """
 
-import os
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -34,15 +37,7 @@ from shared import (
     STAGE_COLORS, assign_lanes, maybe_show_rice_fertilizer_note,
     EFFICIENCY_BADGE, normalize_efficiency, EFFICIENCY_LEGEND,
 )
-
-DEFAULT_PATH_THREAT = "crop_timeline.xlsx"
-
-SHEET_NAMES_THREAT = [
-    "crop_stage", "crop_weeds", "weed_her",
-    "crop_pest", "pest_ins",
-    "crop_disease", "disease_fun",
-    "fertilizer",
-]
+from data_threat import DEFAULT_PATH_THREAT, load_workbook_threat, get_file_threat
 
 PALETTE = [
     "#457B9D", "#E76F51", "#2A9D8F", "#E9C46A", "#6A994E",
@@ -55,38 +50,6 @@ BOARD_TITLES_THREAT = {
     "Disease": "Disease Pressure Windows",
     "Fertilizer": "Fertilizer Application Windows",
 }
-
-
-@st.cache_data
-def load_workbook_threat(file):
-    sheets = {}
-    for name in SHEET_NAMES_THREAT:
-        try:
-            df = pd.read_excel(file, sheet_name=name)
-            df.columns = [c.strip() for c in df.columns]
-            df = df.loc[:, ~df.columns.str.startswith("Unnamed:")]
-            for col in df.columns:
-                if df[col].dtype == object:
-                    df[col] = df[col].apply(lambda v: v.strip() if isinstance(v, str) else v)
-            sheets[name] = df
-        except ValueError:
-            sheets[name] = pd.DataFrame()
-    return sheets
-
-
-def get_file_threat():
-    st.sidebar.subheader("Threat & Input data source")
-    uploaded = st.sidebar.file_uploader(
-        "Upload workbook (.xlsx)", type=["xlsx"], key="threat_uploader"
-    )
-    if st.sidebar.button("🔄 Reload data", key="threat_reload"):
-        st.cache_data.clear()
-        st.rerun()
-    if uploaded is not None:
-        return uploaded
-    if os.path.exists(DEFAULT_PATH_THREAT):
-        return DEFAULT_PATH_THREAT
-    return None
 
 
 def aggregate_chemicals(merged: pd.DataFrame, group_cols: list,
