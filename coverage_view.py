@@ -1,170 +1,951 @@
 """
-Chemical Analysis view — a heatmap answering "how does chemical X
-perform against every weed/pest/disease on this crop?", built by
-picking chemicals one at a time so you can compare a handful side by
-side rather than seeing everything at once.
+Product Coverage view — reads crop_timeline_coverage.xlsx. Also contains
+the AI analysis feature (build_full_coverage_summary / get_ai_analysis),
+kept in this module rather than split out further because the AI summary
+calls this module's own board functions (weed_board_cov, etc.) directly —
+splitting AI analysis into its own file would create a circular import
+between the two modules.
 
-Reads crop_timeline.xlsx (via data_threat.py), 3 dedicated long/tidy
-sheets — one row per (chemical, target) pairing, kept deliberately
-separate from weed_her/pest_ins/disease_fun so this feature can never
-affect the Crop Threat & Input chart's hover text, no matter how much
-data gets added here:
+Window-definition sheets (one row per crop/stage window):
+  crop_stage    : crop_id, crop, stage, stage_th, start_day, end_day
+  crop_weeds    : crop_id, ws_id, weed_stage, weed_id, weed_name_en,
+                  weed_name_th, weed_science, type, start_day, end_day
+  crop_pest     : crop_id, pest_id, pest_name_en, pest_name_th, order,
+                  start_day, end_day, rank
+  crop_disease  : crop_id, disease_id, disease_name_en, disease_name_th,
+                  disease_name_sc, type, start_day, end_day
+  crop_fer      : crop_id, crop, stage_id, stage, start_day, end_day
 
-  weed_matrix    : crop, common_name, weed_name, weed_stage, efficiency
-  insect_matrix  : crop, common_name, insect_name, efficiency
-  disease_matrix : crop, common_name, disease_name, efficiency
+Product MASTER sheets (one row per product — single source of truth
+for trade name, company, concentration, code, tier, and price):
+  prod_her : her_id, trade_name, company, common_name, concentration,
+             formulation_type, hrac_code, tier, price, size, usage,
+             price_per_rai
+  prod_ins : ins_id, trade_name, company, common_name, concentration,
+             formulation_type, irac_code, tier, price, size, usage,
+             price_per_20l
+  prod_fun : fun_id, trade_name, company, common_name, concentration,
+             formulation_type, frac_code, tier, price, size, usage,
+             price_per_20l
+  prod_fer : fer_id, brand, formula, company, type, tier,
+             price_per_ton, bag_size, price_per_bag
 
-"crop" is the crop's display NAME (matching crop_stage's "crop"
-column), not crop_id — kept simple for manual data entry. efficiency
-uses the same Excellent/Effective/Moderate/Poor/Ineffective scale as
-everywhere else; blank/missing shows as Unrated (gray), not assumed bad.
+price_per_rai / price_per_20l / price_per_bag are Excel-formula results
+(already computed in the sheet from price/size/usage) — Python just
+reads them as plain numbers, no calculation happens here. Units differ
+deliberately by category: herbicide cost is per rai (field-level
+application cost), insecticide/fungicide cost is per 20L spray tank
+(the standard mixing basis), fertilizer cost is per bag (retail) with
+price_per_ton as the bulk reference. Never compare these numbers
+across categories without converting first — ฿/rai and ฿/20L are not
+the same unit.
 
-weed_stage (Weed only — e.g. "Pre-emergence", "Early Post", "Late
-Post") is the spray timing, same concept as crop_weeds' weed_stage
-column used in the Price Comparison view's "Spray Timing" filter.
-Optional column: if it's missing from the sheet, the Weed board simply
-skips offering the timing filter rather than erroring.
+JUNCTION sheets (slim — link a window to a product by ID; kept as
+separate sheets per category so they stay easy to scan/edit):
+  weed_her    : crop_id, ws_id, weed_id, weed_name_th, her_id, trade_name,
+                efficiency
+  pest_ins    : crop_id, pest_id, pest_name_th, ins_id, trade_name,
+                efficiency
+  disease_fun : crop_id, disease_id, disease_name_th, fun_id, trade_name,
+                efficiency
+  fertilizer  : crop_id, stage_id, fer_id, stage
+
+tier (on every master sheet) accepts a range of real-world spellings
+(e.g. "premium", "Mid-Tier", "generic") — see TIER_ALIASES in shared.py.
+Blank or unrecognized values fall back to Generic. company must exist
+on each master sheet for the company filter/coverage check to work —
+if it's missing (e.g. prod_fer hasn't been given one yet), that
+category is silently skipped rather than crashing.
 """
 
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
-from shared import EFFICIENCY_ORDER, EFFICIENCY_SCORE, normalize_efficiency, EFFICIENCY_LEGEND
-from data_threat import DEFAULT_PATH_THREAT, load_workbook_threat, get_file_threat
+from shared import (
+    STAGE_COLORS, assign_lanes, maybe_show_rice_fertilizer_note,
+    TIER_ORDER, TIER_BADGE, normalize_tier,
+    EFFICIENCY_ORDER, EFFICIENCY_BADGE, normalize_efficiency, EFFICIENCY_LEGEND,
+    _format_price, _format_cost_range,
+)
+from data_cov import (
+    DEFAULT_PATH_COV, CATEGORY_CONFIG_COV,
+    load_workbook_cov, get_file_cov, load_product_df,
+)
 
-CHEMICAL_MATRIX_CONFIG = {
-    # stage_col is Weed-only, matching Price Comparison's pattern —
-    # intentionally absent from Insect/Disease below.
-    "Weed": {"sheet": "weed_matrix", "target_col": "weed_name", "stage_col": "weed_stage"},
-    "Insect": {"sheet": "insect_matrix", "target_col": "insect_name"},
-    "Disease": {"sheet": "disease_matrix", "target_col": "disease_name"},
+COVERED_COLOR = "#4CAF50"      # green — company has a product
+NOT_COVERED_COLOR = "#E63946"  # red   — company has no product
+COVERAGE_COLOR_MAP = {"Has Product": COVERED_COLOR, "No Product": NOT_COVERED_COLOR}
+
+BOARD_TITLES_COV = {
+    "Weed": "Weed Control Windows",
+    "Insect": "Insect Pressure Windows",
+    "Disease": "Disease Pressure Windows",
+    "Fertilizer": "Fertilizer Application Windows",
 }
 
-# Diverging-by-name (not by number) colorscale so the color at each
-# score lines up with the badge colors used everywhere else in the app
-# (Excellent=green ... Ineffective=red), with a distinct gray for
-# Unrated so "not yet rated" never looks like "confirmed bad".
-_HEATMAP_COLORSCALE = [
-    [0.00, "#BDBDBD"],   # 0 - Unrated
-    [0.20, "#BDBDBD"],
-    [0.20, "#E63946"],   # 1 - Ineffective
-    [0.40, "#E63946"],
-    [0.40, "#F4A261"],   # 2 - Poor
-    [0.60, "#F4A261"],
-    [0.60, "#F6D55C"],   # 3 - Moderate
-    [0.80, "#F6D55C"],
-    [0.80, "#8FCB89"],   # 4 - Effective
-    [0.90, "#8FCB89"],
-    [0.90, "#2A9D8F"],   # 5 - Excellent
-    [1.00, "#2A9D8F"],
-]
+
+def _default_product_html(g: pd.DataFrame, code_col: str, code_label: str,
+                           cost_col: str = None, cost_unit_label: str = None) -> str:
+    lines = []
+    for _, r in g.iterrows():
+        trade = r.get("trade_name", "")
+        common = r.get("common_name", "")
+        conc = r.get("concentration", "")
+        form = r.get("formulation_type", "")
+        code = r.get(code_col, "")
+        tier = TIER_BADGE[normalize_tier(r.get("tier"))]
+        efficiency = EFFICIENCY_BADGE[normalize_efficiency(r.get("efficiency")) or "Unrated"]
+        cost_str = ""
+        if cost_col:
+            price_fmt = _format_price(r.get(cost_col))
+            if price_fmt:
+                cost_str = f" | Cost: {price_fmt}/{cost_unit_label}"
+        lines.append(f"• <b>{trade}</b> — {common} {conc} ({form}) [{code_label} {code}] "
+                     f"Tier: {tier} | Efficiency: {efficiency}{cost_str}")
+    return "<br>".join(lines) if lines else "—"
 
 
-def _matrix_stage_options(matrix_df: pd.DataFrame, cfg: dict, crop_choice: str) -> list:
-    """Distinct spray-timing values (e.g. Pre-emergence/Early Post/Late
-    Post) for this crop, only meaningful when cfg has a 'stage_col'
-    (currently just Weed). Returns [] for categories without the
-    concept, or if the column isn't present in the sheet yet — the
-    caller treats an empty list as 'no timing filter to offer'."""
-    stage_col = cfg.get("stage_col")
-    if not stage_col or matrix_df.empty or stage_col not in matrix_df.columns or "crop" not in matrix_df.columns:
-        return []
-    df = matrix_df[matrix_df["crop"].astype(str).str.strip() == str(crop_choice).strip()]
-    return sorted({str(v).strip() for v in df[stage_col].dropna() if str(v).strip()})
+def _fertilizer_product_html(g: pd.DataFrame, code_col: str, code_label: str,
+                              cost_col: str = None, cost_unit_label: str = None) -> str:
+    lines = []
+    for _, r in g.iterrows():
+        formula = r.get("formula", "")
+        brand = r.get("brand", "")
+        ftype = r.get("type", "")
+        tier = TIER_BADGE[normalize_tier(r.get("tier"))]
+        price_parts = []
+        bag_price = _format_price(r.get("price_per_bag"))
+        if bag_price:
+            bag_size = r.get("bag_size", "")
+            # bag_size is a bare number (e.g. 25, 50) representing kg per
+            # bag — append the unit so the hover reads "25kg" not "25".
+            size_note = ""
+            if pd.notna(bag_size) and str(bag_size).strip() != "":
+                try:
+                    size_note = f" ({float(bag_size):g}kg)"
+                except (TypeError, ValueError):
+                    size_note = f" ({bag_size})"
+            price_parts.append(f"{bag_price}/bag{size_note}")
+        ton_price = _format_price(r.get("price_per_ton"))
+        if ton_price:
+            price_parts.append(f"{ton_price}/ton")
+        price_str = " | Cost: " + " | ".join(price_parts) if price_parts else ""
+        lines.append(f"• <b>{brand}</b> — {formula} ({ftype}) Tier: {tier}{price_str}")
+    return "<br>".join(lines) if lines else "—"
 
 
-def _matrix_for_crop(matrix_df: pd.DataFrame, cfg: dict, crop_choice: str,
-                      stage_filter: str = None) -> pd.DataFrame:
-    """Rows for this crop only, with efficiency normalized. Returns
-    empty if the sheet doesn't exist yet or has no rows for this crop.
-    stage_filter, when given and cfg has a 'stage_col', narrows this to
-    only rows at that spray timing (e.g. only 'Early Post' rows)."""
-    target_col = cfg["target_col"]
-    if matrix_df.empty or target_col not in matrix_df.columns or "crop" not in matrix_df.columns:
-        return pd.DataFrame(columns=["crop", "common_name", target_col, "efficiency"])
-    df = matrix_df[matrix_df["crop"].astype(str).str.strip() == str(crop_choice).strip()].copy()
-    stage_col = cfg.get("stage_col")
-    if stage_filter and stage_col and stage_col in df.columns:
-        df = df[df[stage_col].astype(str).str.strip() == stage_filter]
+def compute_coverage(window_df: pd.DataFrame, product_df: pd.DataFrame,
+                      key_cols: list, company: str,
+                      code_col: str, code_label: str,
+                      product_html_fn=_default_product_html,
+                      track_moa: bool = False,
+                      track_efficiency: bool = False,
+                      track_cost: bool = False,
+                      cost_col: str = None,
+                      cost_unit_label: str = None,
+                      name_col: str = "trade_name",
+                      common_col: str = "common_name") -> pd.DataFrame:
+    """track_moa=True additionally computes, per window, how many DISTINCT
+    resistance codes (HRAC/IRAC/FRAC) the covering products use — a single
+    group across every product covering that window is a resistance-
+    rotation flag. Not meaningful for the fertilizer board (code_col there
+    is "type", not a resistance class), so it defaults off.
+
+    track_efficiency=True additionally computes, per window, the set of
+    distinct efficiency ratings (Excellent/Effective/Moderate/Poor/
+    Ineffective, from the junction sheet's "efficiency" column) among the
+    covering products — a window can be 'Has Product' but still poorly
+    covered if every covering product rates Poor or Ineffective. Not
+    meaningful for fertilizer (no efficiency concept there), so it defaults
+    off.
+
+    track_cost=True additionally computes, per window, a 'cost_summary'
+    string collapsing the covering products' cost_col value(s) into a
+    single price or a range (e.g. '฿95/rai' or '฿95–120/rai' when
+    multiple covering products disagree). cost_unit_label is the unit
+    text shown after the price (e.g. 'rai', '20L tank', 'bag') — units
+    differ by category, so this must be passed explicitly rather than
+    assumed. For fertilizer, product_html_fn (_fertilizer_product_html)
+    reads price_per_bag/price_per_ton/bag_size directly rather than via
+    cost_col, but cost_col='price_per_bag' still drives this function's
+    own cost_summary aggregation so the detail table gets one too.
+
+    name_col/common_col control which columns feed the plain-text
+    product_names / active_ingredients output columns — trade_name/
+    common_name for weed/insect/disease, brand/formula for fertilizer."""
+    df = window_df.copy()
+
+    if product_df.empty or not company or "company" not in product_df.columns:
+        df["covered"] = False
+        df["coverage_status"] = "No Product"
+        df["product_list_html"] = "—"
+        df["other_company_count"] = 0
+        df["tier_mix"] = "—"
+        df["product_names"] = "—"
+        df["active_ingredients"] = "—"
+        if track_moa:
+            df["moa_mix"] = "—"
+            df["moa_group_count"] = 0
+        if track_efficiency:
+            df["efficiency_mix"] = "—"
+        if track_cost:
+            df["cost_summary"] = "—"
+        return df
+
+    company_products = product_df[product_df["company"].astype(str) == str(company)]
+    other_products = product_df[product_df["company"].astype(str) != str(company)]
+
+    matched_map = {}
+    tier_mix_map = {}
+    moa_mix_map = {}
+    efficiency_mix_map = {}
+    cost_summary_map = {}
+    product_names_map = {}
+    active_ing_map = {}
+    if not company_products.empty:
+        for keys, g in company_products.groupby(key_cols, dropna=False):
+            k = keys if isinstance(keys, tuple) else (keys,)
+            matched_map[k] = product_html_fn(g, code_col, code_label, cost_col, cost_unit_label)
+            tiers_present = {normalize_tier(t) for t in g.get("tier", pd.Series(dtype=object))}
+            tier_mix_map[k] = ", ".join(t for t in TIER_ORDER if t in tiers_present) or "—"
+            if track_moa and code_col in g.columns:
+                codes_present = sorted({str(c) for c in g[code_col].dropna().astype(str) if str(c).strip()})
+                moa_mix_map[k] = codes_present
+            if track_efficiency:
+                raw_efficiencies = [normalize_efficiency(v) for v in g.get("efficiency", pd.Series(dtype=object))]
+                efficiencies_present = {e for e in raw_efficiencies if e is not None}
+                efficiency_mix_map[k] = (
+                    ", ".join(e for e in EFFICIENCY_ORDER if e in efficiencies_present)
+                    if efficiencies_present else "Unrated"
+                )
+            if track_cost and cost_col and cost_col in g.columns:
+                cost_summary_map[k] = _format_cost_range(g[cost_col].tolist(), cost_unit_label)
+            names_present = sorted({str(v).strip() for v in g.get(name_col, pd.Series(dtype=object)).dropna()
+                                     if str(v).strip()})
+            product_names_map[k] = "; ".join(names_present) if names_present else "—"
+            common_present = sorted({str(v).strip() for v in g.get(common_col, pd.Series(dtype=object)).dropna()
+                                      if str(v).strip()})
+            active_ing_map[k] = "; ".join(common_present) if common_present else "—"
+
+    other_count_map = {}
+    if not other_products.empty:
+        for keys, g in other_products.groupby(key_cols, dropna=False):
+            other_count_map[keys if isinstance(keys, tuple) else (keys,)] = g["company"].nunique()
+
+    def _row_key(row):
+        vals = tuple(row[c] for c in key_cols)
+        return vals
+
+    df["_key"] = df.apply(_row_key, axis=1)
+    df["covered"] = df["_key"].isin(matched_map.keys())
+    df["coverage_status"] = df["covered"].map({True: "Has Product", False: "No Product"})
+    df["product_list_html"] = df["_key"].map(lambda k: matched_map.get(k, "—"))
+    df["other_company_count"] = df["_key"].map(lambda k: other_count_map.get(k, 0))
+    df["tier_mix"] = df["_key"].map(lambda k: tier_mix_map.get(k, "—"))
+    df["product_names"] = df["_key"].map(lambda k: product_names_map.get(k, "—"))
+    df["active_ingredients"] = df["_key"].map(lambda k: active_ing_map.get(k, "—"))
+    if track_moa:
+        df["moa_mix"] = df["_key"].map(lambda k: ", ".join(moa_mix_map.get(k, [])) or "—")
+        df["moa_group_count"] = df["_key"].map(lambda k: len(moa_mix_map.get(k, [])))
+    if track_efficiency:
+        df["efficiency_mix"] = df["_key"].map(lambda k: efficiency_mix_map.get(k, "—"))
+    if track_cost:
+        df["cost_summary"] = df["_key"].map(lambda k: cost_summary_map.get(k, "—"))
+    df = df.drop(columns=["_key"])
     return df
 
 
-def _build_heatmap(df: pd.DataFrame, target_col: str, chemicals: list) -> go.Figure:
-    """chemicals is the ordered list of chemicals to show as rows (the
-    order the user picked them in, top to bottom on screen — reversed
-    for Plotly since heatmap y-axis renders bottom-to-top by default).
-    Columns are every distinct target in df for this crop."""
-    targets = sorted(df[target_col].dropna().astype(str).str.strip().unique().tolist())
-    if not targets or not chemicals:
+def get_companies_for_crop(sheets: dict, crop_id) -> list:
+    companies = set()
+    for junction_name in CATEGORY_CONFIG_COV:
+        merged = load_product_df(sheets, junction_name, crop_id)
+        if merged.empty or "company" not in merged.columns:
+            continue
+        companies.update(merged["company"].dropna().astype(str).unique().tolist())
+    return sorted(companies)
+
+
+def build_timeline_chart_cov(df: pd.DataFrame, row_col: str,
+                              color_col: str, hover_fn, title: str,
+                              stage_df: pd.DataFrame = None, stage_label_col: str = "stage",
+                              show_legend: bool = True, row_label_map: dict = None,
+                              custom_color_map: dict = None,
+                              force_show_legend: bool = False,
+                              sort_col: str = None) -> go.Figure:
+    if df.empty:
         fig = go.Figure()
-        fig.update_layout(height=120, title="Pick at least one chemical to see the heatmap")
+        fig.update_layout(height=120, title=f"{title} — no data for this crop")
         return fig
 
-    # Look up rating per (chemical, target); a chemical/target pair with
-    # no matching row is Unrated, not an error.
-    lookup = {}
-    for _, r in df.iterrows():
-        chem = str(r.get("common_name", "")).strip()
-        tgt = str(r.get(target_col, "")).strip()
-        eff = normalize_efficiency(r.get("efficiency")) or "Unrated"
-        lookup[(chem, tgt)] = eff
+    order_key = sort_col if sort_col else color_col
+    order_df = (
+        df.groupby(row_col)
+        .agg(**{order_key: (order_key, "first"), "start_day": ("start_day", "min")})
+        .reset_index()
+        .sort_values([order_key, "start_day"])
+    )
+    row_order = order_df[row_col].tolist()
+    row_to_base = {r: i for i, r in enumerate(row_order)}
+    n_rows = len(row_order)
 
-    z = []       # numeric score per cell, for coloring
-    text = []    # rating word per cell, for the label/hover
-    for chem in reversed(chemicals):  # reversed so first-picked ends up on top
-        row_z, row_text = [], []
-        for tgt in targets:
-            eff = lookup.get((chem.strip(), tgt), "Unrated")
-            row_z.append(EFFICIENCY_SCORE[eff])
-            row_text.append(eff)
-        z.append(row_z)
-        text.append(row_text)
+    color_values = sorted(df[color_col].dropna().astype(str).unique().tolist())
+    color_map = dict(custom_color_map) if custom_color_map else {}
+    default_palette = ["#457B9D", "#E76F51", "#2A9D8F", "#E9C46A", "#6A994E"]
+    for i, v in enumerate(color_values):
+        if v not in color_map:
+            color_map[v] = default_palette[i % len(default_palette)]
+    multi_category = len(color_values) > 1
 
-    fig = go.Figure(data=go.Heatmap(
-        z=z,
-        x=targets,
-        y=list(reversed(chemicals)),
-        text=text,
-        texttemplate="%{text}",
-        textfont=dict(size=17),
-        colorscale=_HEATMAP_COLORSCALE,
-        zmin=0, zmax=5,
-        showscale=False,
-        hovertemplate="<b>%{y}</b> vs <b>%{x}</b><br>%{text}<extra></extra>",
-        xgap=3, ygap=3,
-    ))
+    fig = go.Figure()
+    annotations = []
+
+    STAGE_ROW_Y = -1.3
+    top_of_axis = -0.5
+    if stage_df is not None and not stage_df.empty:
+        sdf = stage_df.sort_values("start_day").reset_index(drop=True)
+        for i, srow in sdf.iterrows():
+            duration = srow["end_day"] - srow["start_day"]
+            fig.add_trace(go.Bar(
+                x=[duration], y=[STAGE_ROW_Y], base=[srow["start_day"]],
+                orientation="h", width=0.7,
+                marker=dict(color=STAGE_COLORS[i % len(STAGE_COLORS)],
+                            line=dict(color="white", width=1)),
+                hovertemplate=f"<b>{srow[stage_label_col]}</b><br>Day "
+                               f"{srow['start_day']}–{srow['end_day']}<extra></extra>",
+                showlegend=False,
+            ))
+            mid = (srow["start_day"] + srow["end_day"]) / 2
+            annotations.append(dict(
+                x=mid, y=STAGE_ROW_Y, xref="x", yref="y",
+                text=str(srow[stage_label_col]), showarrow=False,
+                font=dict(color="white", size=17, family="Georgia, serif"),
+                xanchor="center", yanchor="middle",
+            ))
+        top_of_axis = STAGE_ROW_Y - 0.8
+
+    seen_legend = set()
+    row_lane_counts = {}
+    for row_val, group in df.groupby(row_col):
+        lane_map, n_lanes = assign_lanes(group)
+        row_lane_counts[row_val] = n_lanes
+        base_y = row_to_base[row_val]
+        lane_height = min(0.8 / n_lanes, 0.5)
+
+        for idx, lane in lane_map.items():
+            row = df.loc[idx]
+            duration = row["end_day"] - row["start_day"]
+            y_center = base_y + (lane - (n_lanes - 1) / 2) * lane_height
+            cat = str(row.get(color_col, ""))
+            color = color_map.get(cat, "#999999")
+            show_this_legend = (multi_category or force_show_legend) and cat not in seen_legend
+            seen_legend.add(cat)
+
+            fig.add_trace(go.Bar(
+                x=[duration],
+                y=[y_center],
+                base=[row["start_day"]],
+                orientation="h",
+                width=lane_height * 0.85,
+                marker=dict(color=color, line=dict(color="white", width=1)),
+                hovertemplate=hover_fn(row),
+                name=cat if cat else "—",
+                legendgroup=cat,
+                showlegend=show_this_legend,
+            ))
+
+    total_lane_rows = sum(row_lane_counts.values())
+
+    xaxis = dict(showgrid=True, title=dict(text="Day after planting", font=dict(size=19)),
+                 tickfont=dict(size=18))
+    if stage_df is not None and not stage_df.empty:
+        sdf = stage_df.sort_values("start_day").reset_index(drop=True)
+        stage_min = float(sdf["start_day"].min())
+        stage_max = float(sdf["end_day"].max())
+        span = stage_max - stage_min
+        step = 20
+        day_ticks = list(range(0, int(stage_max) + 1, step))
+        if not day_ticks or day_ticks[-1] != int(stage_max):
+            day_ticks.append(int(stage_max))
+        xaxis.update(
+            tickmode="array",
+            tickvals=day_ticks,
+            ticktext=[str(t) for t in day_ticks],
+            range=[stage_min - span * 0.02, stage_max + span * 0.02],
+        )
+
+    y_ticks = [row_to_base[r] for r in row_order]
+    y_ticktext = [row_label_map.get(r, r) for r in row_order] if row_label_map else list(row_order)
+    if stage_df is not None and not stage_df.empty:
+        y_ticks = [STAGE_ROW_Y] + y_ticks
+        y_ticktext = ["Crop Stage"] + y_ticktext
+
     fig.update_layout(
-        # Extra top margin/height headroom for the rotated, larger x-axis
-        # labels (weed/pest/disease names are often long) — automargin
-        # lets Plotly grow the margin further still if a name is
-        # especially long, rather than clipping it.
-        height=max(260, 160 + 60 * len(chemicals)),
-        margin=dict(l=10, r=10, t=140, b=10),
-        xaxis=dict(
-            tickfont=dict(size=17), side="top",
-            tickangle=-45, automargin=True,
+        barmode="overlay",
+        height=max(240, 150 + total_lane_rows * 54),
+        margin=dict(l=10, r=10, t=30, b=10),
+        xaxis=xaxis,
+        yaxis=dict(
+            tickmode="array",
+            tickvals=y_ticks,
+            ticktext=y_ticktext,
+            range=[n_rows - 0.5, top_of_axis],
+            title="",
+            tickfont=dict(size=19),
+            automargin=True,
         ),
-        yaxis=dict(tickfont=dict(size=18), automargin=True),
+        annotations=annotations,
+        showlegend=(multi_category or force_show_legend) and show_legend,
+        legend_title_text="Coverage",
+        legend=dict(font=dict(size=17)),
+        hoverlabel=dict(font=dict(size=20), align="left"),
         font=dict(size=17),
     )
     return fig
 
 
-def render_chemical_analysis_view():
-    st.title("🧪 Chemical Analysis")
-    st.caption("Compare how a few chemicals perform against every weed, pest, or disease on a crop.")
+def weed_board_cov(crop_id, sheets, crop_stage_df, stage_label_col, company):
+    is_thai = stage_label_col.endswith("_th")
+    window_df = sheets["crop_weeds"][sheets["crop_weeds"]["crop_id"] == crop_id].copy()
+    product_df = load_product_df(sheets, "weed_her", crop_id)
 
-    data_file = get_file_threat()
+    key_cols = ["ws_id", "weed_id"]
+    df = compute_coverage(window_df, product_df, key_cols, company, "hrac_code", "HRAC",
+                           track_moa=True, track_efficiency=True, track_cost=True,
+                           cost_col="price_per_rai", cost_unit_label="rai")
+    df = df.rename(columns={"moa_mix": "hrac_mix", "moa_group_count": "hrac_group_count"})
+
+    name_col = "weed_name_th" if is_thai else "weed_science"
+    row_label_map = {
+        r: f"[{t}] {n}" for r, n, t in zip(df["weed_science"], df[name_col], df["type"])
+    }
+
+    def hover(row):
+        base = (
+            f"<b><i>{row['weed_science']}</i></b><br>"
+            f"{row['weed_name_en']} / {row['weed_name_th']}<br>"
+            f"Type: {row.get('type', '')} | Stage: {row.get('weed_stage', '')}<br>"
+            f"Day {row['start_day']}–{row['end_day']}<br><br>"
+        )
+        if row["covered"]:
+            moa_line = f"<br><i>HRAC groups: {row['hrac_mix']} ({row['hrac_group_count']} distinct)</i>" \
+                if row['hrac_group_count'] else ""
+            return base + f"<b>{company} products:</b><br>{row['product_list_html']}{moa_line}<extra></extra>"
+        extra = f"<br><i>{row['other_company_count']} other company(ies) cover this</i>" if row['other_company_count'] else ""
+        return base + f"<b>{company}: no product</b>{extra}<extra></extra>"
+
+    fig = build_timeline_chart_cov(df, row_col="weed_science", color_col="coverage_status",
+                                    hover_fn=hover, title="Weed Control Windows",
+                                    stage_df=crop_stage_df, stage_label_col=stage_label_col,
+                                    row_label_map=row_label_map, sort_col="type",
+                                    custom_color_map=COVERAGE_COLOR_MAP, force_show_legend=True)
+    detail_cols = ["weed_stage", "weed_science", "weed_name_en", "weed_name_th",
+                   "type", "start_day", "end_day", "coverage_status", "tier_mix",
+                   "efficiency_mix", "cost_summary", "product_names", "active_ingredients",
+                   "hrac_mix", "hrac_group_count"]
+    return fig, df[detail_cols], df["covered"].sum(), len(df)
+
+
+def pest_board_cov(crop_id, sheets, crop_stage_df, stage_label_col, company):
+    is_thai = stage_label_col.endswith("_th")
+    window_df = sheets["crop_pest"][sheets["crop_pest"]["crop_id"] == crop_id].copy()
+    product_df = load_product_df(sheets, "pest_ins", crop_id)
+
+    has_rank = "rank" in window_df.columns
+    if has_rank:
+        # Unranked rows sort to the bottom instead of crashing/reordering
+        # unpredictably.
+        window_df["rank"] = pd.to_numeric(window_df["rank"], errors="coerce").fillna(float("inf"))
+
+    key_cols = ["pest_id"]
+    df = compute_coverage(window_df, product_df, key_cols, company, "irac_code", "IRAC",
+                           track_moa=True, track_efficiency=True, track_cost=True,
+                           cost_col="price_per_20l", cost_unit_label="20L tank")
+    df = df.rename(columns={"moa_mix": "irac_mix", "moa_group_count": "irac_group_count"})
+
+    name_col = "pest_name_th" if is_thai else "pest_name_en"
+    row_label_map = {
+        r: f"[{o}] {n}" for r, n, o in zip(df["pest_name_en"], df[name_col], df["order"])
+    }
+
+    def hover(row):
+        rank_line = f"Rank: {int(row['rank'])}<br>" if has_rank and row['rank'] != float("inf") else ""
+        base = (
+            f"<b>{row['pest_name_en']}</b><br>"
+            f"{row['pest_name_th']}<br>"
+            f"Insect order: {row.get('order', '')}<br>"
+            f"{rank_line}"
+            f"Day {row['start_day']}–{row['end_day']}<br><br>"
+        )
+        if row["covered"]:
+            moa_line = f"<br><i>IRAC groups: {row['irac_mix']} ({row['irac_group_count']} distinct)</i>" \
+                if row['irac_group_count'] else ""
+            return base + f"<b>{company} products:</b><br>{row['product_list_html']}{moa_line}<extra></extra>"
+        extra = f"<br><i>{row['other_company_count']} other company(ies) cover this</i>" if row['other_company_count'] else ""
+        return base + f"<b>{company}: no product</b>{extra}<extra></extra>"
+
+    fig = build_timeline_chart_cov(df, row_col="pest_name_en", color_col="coverage_status",
+                                    hover_fn=hover, title="Insect Pressure Windows",
+                                    stage_df=crop_stage_df, stage_label_col=stage_label_col,
+                                    row_label_map=row_label_map,
+                                    sort_col="rank" if has_rank else "order",
+                                    custom_color_map=COVERAGE_COLOR_MAP, force_show_legend=True)
+    detail_cols = ["pest_name_en", "pest_name_th", "order", "start_day", "end_day",
+                   "coverage_status", "tier_mix", "efficiency_mix", "cost_summary",
+                   "product_names", "active_ingredients", "irac_mix", "irac_group_count"]
+    if has_rank:
+        detail_cols.insert(3, "rank")
+    return fig, df[detail_cols], df["covered"].sum(), len(df)
+
+
+def disease_board_cov(crop_id, sheets, crop_stage_df, stage_label_col, company):
+    is_thai = stage_label_col.endswith("_th")
+    window_df = sheets["crop_disease"][sheets["crop_disease"]["crop_id"] == crop_id].copy()
+    product_df = load_product_df(sheets, "disease_fun", crop_id)
+
+    key_cols = ["disease_id"]
+    df = compute_coverage(window_df, product_df, key_cols, company, "frac_code", "FRAC",
+                           track_moa=True, track_efficiency=True, track_cost=True,
+                           cost_col="price_per_20l", cost_unit_label="20L tank")
+    df = df.rename(columns={"moa_mix": "frac_mix", "moa_group_count": "frac_group_count"})
+
+    name_col = "disease_name_th" if is_thai else "disease_name_en"
+    row_label_map = {
+        r: f"[{t}] {n}" for r, n, t in zip(df["disease_name_sc"], df[name_col], df["type"])
+    }
+
+    def hover(row):
+        base = (
+            f"<b><i>{row['disease_name_sc']}</i></b><br>"
+            f"{row['disease_name_en']} / {row['disease_name_th']}<br>"
+            f"Type: {row.get('type', '')}<br>"
+            f"Day {row['start_day']}–{row['end_day']}<br><br>"
+        )
+        if row["covered"]:
+            moa_line = f"<br><i>FRAC groups: {row['frac_mix']} ({row['frac_group_count']} distinct)</i>" \
+                if row['frac_group_count'] else ""
+            return base + f"<b>{company} products:</b><br>{row['product_list_html']}{moa_line}<extra></extra>"
+        extra = f"<br><i>{row['other_company_count']} other company(ies) cover this</i>" if row['other_company_count'] else ""
+        return base + f"<b>{company}: no product</b>{extra}<extra></extra>"
+
+    fig = build_timeline_chart_cov(df, row_col="disease_name_sc", color_col="coverage_status",
+                                    hover_fn=hover, title="Disease Pressure Windows",
+                                    stage_df=crop_stage_df, stage_label_col=stage_label_col,
+                                    row_label_map=row_label_map, sort_col="type",
+                                    custom_color_map=COVERAGE_COLOR_MAP, force_show_legend=True)
+    detail_cols = ["disease_name_sc", "disease_name_en", "disease_name_th",
+                   "type", "start_day", "end_day", "coverage_status", "tier_mix",
+                   "efficiency_mix", "cost_summary", "product_names", "active_ingredients",
+                   "frac_mix", "frac_group_count"]
+    return fig, df[detail_cols], df["covered"].sum(), len(df)
+
+
+def _fertilizer_coverage_core(crop_id, sheets, crop_stage_df, stage_label_col,
+                               company, type_choice="All"):
+    """No Streamlit widgets in here — safe to call multiple times in the
+    same run (e.g. once for the visible board, once for the AI summary)
+    without triggering a duplicate-widget error."""
+    window_df = sheets["crop_fer"][sheets["crop_fer"]["crop_id"] == crop_id].copy()
+    product_df_all = load_product_df(sheets, "fertilizer", crop_id)
+    product_df = product_df_all if (type_choice == "All" or "type" not in product_df_all.columns) else \
+        product_df_all[product_df_all["type"].astype(str) == type_choice]
+
+    key_cols = ["stage_id"]
+    df = compute_coverage(window_df, product_df, key_cols, company, "type", "Type",
+                           product_html_fn=_fertilizer_product_html,
+                           name_col="brand", common_col="formula",
+                           track_cost=True, cost_col="price_per_bag", cost_unit_label="bag")
+
+    row_label_map = dict(zip(df["stage_id"], df["stage"]))
+
+    def hover(row):
+        base = f"<b>{row['stage']}</b><br>Day {row['start_day']}–{row['end_day']}<br><br>"
+        if row["covered"]:
+            cost = row.get("cost_summary", "")
+            cost_line = f"<br><i>Cost: {cost}</i>" if cost and cost != "—" else ""
+            return base + f"<b>{company} products:</b><br>{row['product_list_html']}{cost_line}<extra></extra>"
+        extra = f"<br><i>{row['other_company_count']} other company(ies) cover this</i>" if row['other_company_count'] else ""
+        return base + f"<b>{company}: no product</b>{extra}<extra></extra>"
+
+    # sort_col="start_day" — order rows chronologically (1st, 2nd, 3rd
+    # application...) instead of grouping by coverage color first.
+    fig = build_timeline_chart_cov(df, row_col="stage_id", color_col="coverage_status",
+                                    hover_fn=hover, title="Fertilizer Application Windows",
+                                    stage_df=crop_stage_df, stage_label_col=stage_label_col,
+                                    row_label_map=row_label_map, sort_col="start_day",
+                                    custom_color_map=COVERAGE_COLOR_MAP, force_show_legend=True)
+    detail_cols = ["stage", "start_day", "end_day", "coverage_status", "tier_mix",
+                   "cost_summary", "product_names", "active_ingredients"]
+    return fig, df[detail_cols], df["covered"].sum(), len(df), product_df_all
+
+
+def fertilizer_board_cov(crop_id, sheets, crop_stage_df, stage_label_col, company):
+    product_df_all = load_product_df(sheets, "fertilizer", crop_id)
+    fert_types = sorted(product_df_all["type"].dropna().astype(str).unique().tolist()) \
+        if "type" in product_df_all.columns else []
+    type_choice = st.selectbox("Fertilizer type", ["All"] + fert_types, key="cov_fert_type")
+    fig, detail_df, covered_n, total_n, _ = _fertilizer_coverage_core(
+        crop_id, sheets, crop_stage_df, stage_label_col, company, type_choice
+    )
+    return fig, detail_df, covered_n, total_n
+
+
+BOARDS_COV = {
+    "Weed": weed_board_cov,
+    "Insect": pest_board_cov,
+    "Disease": disease_board_cov,
+    "Fertilizer": fertilizer_board_cov,
+}
+
+
+# =====================================================================
+# AI analysis — summarize coverage across ALL FOUR boards for the
+# selected crop + company and hand it to Claude directly. The combined
+# table is small (a few dozen rows per board at most), so no retrieval
+# step is needed — just build a compact text summary and send it.
+# =====================================================================
+
+def _entity_coverage_summary(detail_df: pd.DataFrame, entity_col: str, label: str) -> str:
+    """Distinct-entity coverage stats (e.g. per-PEST, not per-window).
+
+    A single pest/weed/disease can have multiple rows in the detail
+    table — one per pressure window within the season — so counting rows
+    answers 'how many windows are covered', not 'how many pests are
+    covered'. This computes the latter correctly by grouping on the
+    entity's name column and checking whether AT LEAST ONE of its
+    windows has a product, so the AI prompt never has to (and can't
+    reliably) infer it by counting CSV rows itself."""
+    if detail_df.empty or entity_col not in detail_df.columns:
+        return f"(no {label} data for this crop)"
+    has_product = detail_df.groupby(entity_col)["coverage_status"].apply(
+        lambda s: bool((s == "Has Product").any())
+    )
+    total = len(has_product)
+    covered = int(has_product.sum())
+    uncovered = sorted(has_product[~has_product].index.tolist())
+    lines = [f"{covered} of {total} distinct {label} have at least one covered window."]
+    if uncovered:
+        lines.append(f"{label.capitalize()} with ZERO covered windows (fully uncovered): "
+                      + "; ".join(uncovered))
+    else:
+        lines.append(f"Every {label} has at least one covered window.")
+    return "\n".join(lines)
+
+
+def _table_for_ai(detail_df: pd.DataFrame, cols: list) -> str:
+    """Raw CSV of the exact detail table shown on screen — Claude reads
+    structured data far more reliably than a hand-flattened summary, and
+    this keeps every name column (English + Thai) explicit instead of
+    guessing which single column to use as a label."""
+    if detail_df.empty:
+        return "(no data for this crop)"
+    present = [c for c in cols if c in detail_df.columns]
+    return detail_df[present].to_csv(index=False)
+
+
+def build_full_coverage_summary(crop_id, sheets, crop_stage_df, label_col,
+                                 crop_choice: str, company: str) -> str:
+    _, weed_df, _, _ = weed_board_cov(crop_id, sheets, crop_stage_df, label_col, company)
+    _, pest_df, _, _ = pest_board_cov(crop_id, sheets, crop_stage_df, label_col, company)
+    _, disease_df, _, _ = disease_board_cov(crop_id, sheets, crop_stage_df, label_col, company)
+    _, fert_df, _, _, _ = _fertilizer_coverage_core(crop_id, sheets, crop_stage_df, label_col, company)
+
+    # Note: cost_summary is deliberately excluded from what's sent to the
+    # AI (even though it's computed and shown in the on-screen hover/
+    # detail table). Whether a price is expensive, cheap, or justified
+    # depends on real-world market context the model has no way to know —
+    # handing it price numbers risks a confident-sounding but baseless
+    # value judgment. Price stays a human-only decision here.
+    parts = [
+        f"Crop: {crop_choice}",
+        f"Company: {company}",
+        "",
+        "=== Weed (herbicide) coverage ===",
+        "--- Entity-level summary (use THIS for any 'X of Y weeds are covered' "
+        "style statement — do NOT count CSV rows below for this, since one "
+        "weed can have multiple rows for different time windows) ---",
+        _entity_coverage_summary(weed_df, "weed_science", "weeds"),
+        "--- Row-level detail (one row = one pressure window, not one weed) ---",
+        _table_for_ai(weed_df, ["weed_science", "weed_name_en", "weed_name_th", "type",
+                                 "start_day", "end_day", "coverage_status", "tier_mix",
+                                 "efficiency_mix", "product_names",
+                                 "active_ingredients", "hrac_mix", "hrac_group_count"]),
+        "",
+        "=== Insect (insecticide) coverage ===",
+        "--- Entity-level summary (use THIS for any 'X of Y pests are covered' "
+        "style statement — do NOT count CSV rows below for this, since one "
+        "pest can have multiple rows for different time windows) ---",
+        _entity_coverage_summary(pest_df, "pest_name_en", "pests"),
+        "--- Row-level detail (one row = one pressure window, not one pest) ---",
+        _table_for_ai(pest_df, ["pest_name_en", "pest_name_th", "order", "rank",
+                                 "start_day", "end_day", "coverage_status", "tier_mix",
+                                 "efficiency_mix", "product_names",
+                                 "active_ingredients", "irac_mix", "irac_group_count"]),
+        "",
+        "=== Disease (fungicide) coverage ===",
+        "--- Entity-level summary (use THIS for any 'X of Y diseases are "
+        "covered' style statement — do NOT count CSV rows below for this, "
+        "since one disease can have multiple rows for different time "
+        "windows) ---",
+        _entity_coverage_summary(disease_df, "disease_name_sc", "diseases"),
+        "--- Row-level detail (one row = one pressure window, not one disease) ---",
+        _table_for_ai(disease_df, ["disease_name_sc", "disease_name_en", "disease_name_th",
+                                    "type", "start_day", "end_day", "coverage_status",
+                                    "tier_mix", "efficiency_mix", "product_names",
+                                    "active_ingredients", "frac_mix", "frac_group_count"]),
+        "",
+        "=== Fertilizer coverage ===",
+        "(Fertilizer rows are already one-per-application-stage — no "
+        "entity/window distinction applies here. No efficiency_mix — "
+        "efficiency isn't a meaningful concept for fertilizer.)",
+        _table_for_ai(fert_df, ["stage", "start_day", "end_day", "coverage_status", "tier_mix",
+                                 "product_names", "active_ingredients"]),
+    ]
+    return "\n".join(parts)
+
+
+ANALYSIS_STYLE_CONFIG = {
+    "Concise": {
+        # Short and skimmable — a few sentences per category plus one
+        # priority line. Naturally fits comfortably inside 2500 tokens
+        # (which is why 2500 always felt "enough" for a brief summary),
+        # so a lower cap here is both correct and keeps latency down.
+        "instructions": (
+            "Write a SHORT, skimmable summary — not a full report. For "
+            "each of the four categories (Weed, Insect, Disease, "
+            "Fertilizer), give ONE sentence on whether coverage is strong "
+            "or thin — judged from coverage_status AND efficiency_mix "
+            "together, not coverage_status alone, so a category with high "
+            "'Has Product' counts but mostly Poor/Ineffective/Unrated "
+            "efficiency reads as thin, not strong — plus the single most "
+            "important reason why. Skip minor detail, skip restating "
+            "every window, skip a portfolio tier breakdown unless it's "
+            "the single biggest issue. End with ONE sentence naming the "
+            "single highest-priority gap to fix (a true no-product gap "
+            "or a covered-but-low-efficiency soft gap — whichever leaves "
+            "the pest/weed/disease more exposed). Target roughly 250-350 "
+            "words total, in plain natural prose (no headers, no bullet "
+            "list)."
+        ),
+        "max_tokens": 3200,
+        "thai_max_tokens": 4000,
+    },
+    "Detailed": {
+        # Full walkthrough — covers all four categories with portfolio
+        # efficiency signals, rotation-risk flags, and a closing summary.
+        "instructions": (
+            "Read all four tables yourself and explain in plain, natural "
+            "prose:\n"
+            "- Where the portfolio is strong and where it's genuinely thin, "
+            "category by category — include all four categories, even "
+            "briefly. Base this judgment on coverage_status AND "
+            "efficiency_mix together, not coverage_status alone — a "
+            "category with high 'Has Product' counts but mostly "
+            "Poor/Ineffective/Unrated efficiency is NOT strong, it's a "
+            "false sense of coverage, and should be described that way.\n"
+            "- Whether it leans Generic, Medium, or Premium overall, and which "
+            "category pulls that either way.\n"
+            "- Windows that are technically covered but efficiency_mix shows "
+            "Poor, Ineffective, or only Unrated — call these out "
+            "explicitly as 'soft gaps', distinct from true no-product "
+            "gaps, since a green light on the coverage board doesn't "
+            "guarantee a strong product is in play. A Moderate rating is "
+            "worth mentioning as middling but isn't itself a soft gap.\n"
+            "- Any single-resistance-code windows worth flagging as a rotation "
+            "risk.\n"
+            "- Any product that's doing a lot of the work across many windows, "
+            "if that pattern shows up.\n"
+            "- End with 2-3 sentences on what to prioritize, weighing true "
+            "no-product gaps against covered-but-low-efficiency soft gaps — "
+            "don't automatically rank a no-product gap above a soft gap; "
+            "judge by which one leaves the pest/weed/disease more exposed.\n\n"
+            "Write it the way you'd actually say it out loud — normal "
+            "sentences, not a stat dump with every number in parentheses. "
+            "Only mention numbers when they help make the point, not on every "
+            "sentence. Aim for concise explanation — enough to cover "
+            "all four categories properly, but don't pad it out."
+        ),
+        # max_tokens=5000: covering all four categories plus portfolio-
+        # efficiency signals, rotation-risk flags, and a closing summary
+        # in one response is comfortably a few thousand tokens of prose
+        # for crops with many pressure windows. 2500 was cutting this off
+        # mid-answer (stop_reason: max_tokens) on larger crops; 5000
+        # gives real headroom without being wastefully large. Note: this
+        # is a ceiling, not a target — a small crop still gets a short
+        # response even with a high cap.
+        "max_tokens": 5000,
+        "thai_max_tokens": 6500,
+    },
+}
+
+
+def get_ai_analysis(summary_text: str, style: str = "Detailed") -> str:
+    try:
+        api_key = st.secrets["anthropic"]["api_key"]
+    except (KeyError, FileNotFoundError):
+        return ("⚠️ Add an `[anthropic]` section with `api_key = \"...\"` to "
+                "`.streamlit/secrets.toml` to enable AI analysis.")
+
+    try:
+        import anthropic
+    except ImportError:
+        return "⚠️ Run `pip install anthropic` to enable AI analysis."
+
+    # Identity-linked keys that aren't scoped to a single workspace need
+    # the workspace id sent explicitly on every request. Workspace-scoped
+    # keys don't need this — leave workspace_id unset in secrets.toml and
+    # it's simply skipped.
+    workspace_id = st.secrets["anthropic"].get("workspace_id")
+    extra_headers = {"anthropic-workspace-id": workspace_id} if workspace_id else {}
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    cfg = ANALYSIS_STYLE_CONFIG.get(style, ANALYSIS_STYLE_CONFIG["Detailed"])
+
+    english_prompt = (
+        "You're an agronomist colleague talking through a product coverage "
+        "table with a teammate — not writing a formal report. Below are "
+        "four CSV tables (Weed, Insect, Disease, Fertilizer) for one crop "
+        "and one company — one row per pressure window. Column notes: "
+        "coverage_status is 'Has Product' or 'No Product' for that window; "
+        "tier_mix lists the tiers (Generic/Medium/Premium) of the covering "
+        "products; product_names lists the trade name(s) (brand name for "
+        "Fertilizer) covering that window; active_ingredients lists the "
+        "common/active-ingredient name(s) (formula for Fertilizer); "
+        "hrac_mix/irac_mix/frac_mix list the distinct resistance codes "
+        "covering that window (a single code = rotation risk); "
+        "efficiency_mix (Weed/Insect/Disease only, not Fertilizer) lists the "
+        "efficiency rating(s) — Excellent/Effective/Moderate/Poor/Ineffective, "
+        "or 'Unrated' if not yet documented — of the product(s) covering "
+        "that window SPECIFICALLY against that pest/weed/disease (the "
+        "same product can rate differently against different targets — "
+        "e.g. Excellent against one pest, Moderate against another). A "
+        "window being 'Has Product' does NOT mean it's well-covered if "
+        "efficiency_mix is Poor, Ineffective, or only Unrated — call that "
+        "out as a soft spot, distinct from a true 'No Product' gap. "
+        "Don't treat 'Unrated' as if it means Ineffective; it only means "
+        "the rating hasn't been documented yet.\n"
+        "Price/cost data is intentionally NOT included in these tables — "
+        "don't discuss pricing, cost-effectiveness, or value for money in "
+        "this analysis, since you have no way to know what a reasonable "
+        "price looks like in this market.\n"
+        "each pest/"
+        "weed/disease has both an English and a Thai name column — use "
+        "whichever name fits naturally, they refer to the same thing.\n\n"
+        "IMPORTANT — a single product commonly appears in the "
+        "product_names column across MANY different rows/windows within "
+        "the same category. That means one product handles multiple "
+        "pests/weeds/diseases, not that each row is a separate product. "
+        "When you notice a product name repeating across several windows, "
+        "call that out as a portfolio efficiency signal (e.g. 'Product X "
+        "alone covers 5 of the 9 covered insect windows') rather than "
+        "treating each row as independent.\n\n"
+        "IMPORTANT — a single pest/weed/disease can also appear across "
+        "MULTIPLE rows, one per pressure window within the season. So the "
+        "number of CSV rows is NOT the number of distinct pests/weeds/"
+        "diseases, and counting rows will give you the wrong number. For "
+        "any statement like 'X of Y pests/weeds/diseases are covered', you "
+        "MUST use the 'Entity-level summary' figure given right before "
+        "each category's table below — never compute this by counting "
+        "rows yourself. Use the word 'window' only when specifically "
+        "describing a single time period from a row (e.g. 'this window in "
+        "May'), and use 'pest'/'weed'/'disease' only when referring to the "
+        "distinct organism using the entity-level count.\n\n"
+        + cfg["instructions"] + "\n\n"
+        "For everything about THIS company's actual coverage — which "
+        "windows have a product, which don't, which trade names/active "
+        "ingredients/tiers/resistance codes appear — stay strictly factual "
+        "and only use what's in the tables below; never invent a product, "
+        "code, or coverage status that isn't there.\n\n"
+        "On top of that, you MAY bring in your own general agronomic "
+        "knowledge to make the analysis more useful — e.g. whether a "
+        "listed active ingredient is generally considered a strong or "
+        "weak choice for that pest/weed/disease, common resistance "
+        "concerns for a given MOA/mode of action, whether a gap is "
+        "typically hard or easy to fill in the market, or general best "
+        "practice context. When you do this, make it clearly read as "
+        "general knowledge/context (e.g. 'X is generally known for...', "
+        "'a common industry concern with this MOA is...') rather than "
+        "presenting it as something read off the table. Please consider "
+        "that each pest/weed/disease should ideally have around 2-3 "
+        "products with different MOA if the company wants to fully cover "
+        "resistance-rotation best practice — flag where that's not met.\n\n"
+        + summary_text
+    )
+
+    # Step 1: English analysis — this is the guaranteed part of the output.
+    try:
+        msg = client.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=cfg["max_tokens"],
+            messages=[{"role": "user", "content": english_prompt}],
+            extra_headers=extra_headers,
+        )
+    except Exception as e:
+        return f"⚠️ AI analysis failed: {e}"
+
+    english_text = "".join(b.text for b in msg.content if b.type == "text").strip()
+
+    if not english_text:
+        # Something came back with no usable text — don't hand an empty
+        # string to the translation step (that's what produced the
+        # confusing "no content was attached" Thai reply). Surface enough
+        # detail to tell a genuine network hiccup apart from e.g. hitting
+        # max_tokens with nothing but reasoning/tool blocks.
+        return (f"⚠️ AI analysis came back empty (stop_reason: `{msg.stop_reason}`). "
+                "This is usually a transient issue — try clicking the button again.")
+
+    # Step 2: Thai version of that exact analysis — best-effort. If this
+    # call fails for any reason, we still return the English analysis
+    # untouched rather than losing it. max_tokens is set well above the
+    # English call's own cap (not just above the English response's
+    # actual length) since Thai script commonly runs more tokens per
+    # word for the same content — too tight a budget here is what was
+    # silently cutting the Thai text off mid-sentence before.
+    translate_prompt = (
+        "Rewrite the following agrochemical portfolio analysis in Thai — "
+        "not a literal, word-for-word translation, but how a Thai-speaking "
+        "agronomist would naturally explain the same points to a colleague. "
+        "Keep every point from the original, including the Fertilizer "
+        "category and the closing priorities — don't drop or shorten any "
+        "section. Keep HRAC/IRAC/FRAC codes, tier names (Generic/Medium/"
+        "Premium), and crop/company/product names untranslated so they "
+        "stay easy to cross-check against the original data. Output ONLY "
+        "the Thai text, no preamble.\n\n"
+        + english_text
+    )
+    try:
+        thai_msg = client.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=cfg["thai_max_tokens"],
+            messages=[{"role": "user", "content": translate_prompt}],
+            extra_headers=extra_headers,
+        )
+        thai_text = "".join(b.text for b in thai_msg.content if b.type == "text")
+        if not thai_text.strip():
+            thai_text = None
+    except Exception:
+        thai_text = None
+
+    if thai_text:
+        return f"## English\n{english_text}\n\n## ภาษาไทย\n{thai_text}"
+    return f"## English\n{english_text}\n\n*(Thai translation unavailable — showing English only.)*"
+
+
+def render_coverage_view():
+    st.title("🧭 Product Coverage Dashboard")
+    st.caption("Pick a company to see where it has products (green) and where it's lagging (red).")
+
+    data_file = get_file_cov()
     if data_file is None:
         st.warning(
             f"No workbook found. Upload one from the sidebar, or place a file "
-            f"named `{DEFAULT_PATH_THREAT}` next to `app.py`."
+            f"named `{DEFAULT_PATH_COV}` next to `app.py`."
         )
         st.stop()
 
     try:
-        sheets = load_workbook_threat(data_file)
+        sheets = load_workbook_cov(data_file)
     except Exception as e:
         st.error(f"Couldn't read the workbook: {e}")
         st.stop()
@@ -174,64 +955,67 @@ def render_chemical_analysis_view():
         st.error("`crop_stage` sheet is missing or empty.")
         st.stop()
 
-    crop_choices = sorted(stage_df_all["crop"].dropna().astype(str).unique().tolist())
+    crop_lookup = stage_df_all[["crop_id", "crop"]].drop_duplicates()
+    crop_name_to_id = dict(zip(crop_lookup["crop"], crop_lookup["crop_id"]))
 
-    col1, col2 = st.columns([2, 1])
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
     with col1:
-        crop_choice = st.selectbox("Crop", crop_choices, key="chem_crop")
+        crop_choice = st.selectbox("Crop", list(crop_name_to_id.keys()), key="cov_crop")
+    crop_id = crop_name_to_id[crop_choice]
+
+    companies = get_companies_for_crop(sheets, crop_id)
     with col2:
-        category_choice = st.selectbox("Category", list(CHEMICAL_MATRIX_CONFIG.keys()), key="chem_category")
-    cfg = CHEMICAL_MATRIX_CONFIG[category_choice]
-    target_col = cfg["target_col"]
-
-    matrix_df = sheets.get(cfg["sheet"], pd.DataFrame())
-    if matrix_df.empty or cfg["sheet"] not in sheets:
-        st.info(
-            f"No `{cfg['sheet']}` sheet found yet in the workbook. Add it with columns "
-            f"`crop, common_name, {target_col}, efficiency` to use this page for {category_choice.lower()}s."
-        )
-        st.stop()
-
-    # Spray Timing (e.g. Pre-emergence / Early Post / Late Post) only
-    # exists for Weed, via weed_matrix's weed_stage column — other
-    # categories simply don't get this filter offered at all.
-    stage_options = _matrix_stage_options(matrix_df, cfg, crop_choice)
-    stage_filter = None
-    if stage_options:
-        stage_choice = st.selectbox(
-            "Spray Timing", ["All"] + stage_options, key="chem_stage"
-        )
-        stage_filter = None if stage_choice == "All" else stage_choice
-
-    crop_df = _matrix_for_crop(matrix_df, cfg, crop_choice, stage_filter=stage_filter)
-    if crop_df.empty:
-        if stage_filter:
-            st.info(f"No {category_choice.lower()} chemical data found for {crop_choice} at '{stage_filter}' timing yet.")
+        if companies:
+            company_choice = st.selectbox("Company", companies, key="cov_company")
         else:
-            st.info(f"No {category_choice.lower()} chemical data found for {crop_choice} yet.")
+            company_choice = None
+            st.warning("No companies found for this crop across weed_her / pest_ins / disease_fun / fertilizer.")
+    with col3:
+        board_choice = st.selectbox("Board", list(BOARDS_COV.keys()), index=0, key="cov_board")
+    with col4:
+        stage_label_choice = st.radio("Label language", ["English", "Thai"],
+                                       horizontal=True, key="cov_lang")
+    label_col = "stage" if stage_label_choice == "English" else "stage_th"
+
+    crop_stage_df = stage_df_all[stage_df_all["crop_id"] == crop_id]
+    if crop_stage_df.empty:
+        st.warning("No stage data for this crop.")
         st.stop()
 
-    chemical_options = sorted(crop_df["common_name"].dropna().astype(str).str.strip().unique().tolist())
+    st.subheader(f"{BOARD_TITLES_COV[board_choice]} — {company_choice or 'no company selected'}")
+    maybe_show_rice_fertilizer_note(crop_choice, board_choice)
 
-    # Selection persists per (crop, category, stage) combo via the
-    # widget key itself, so switching any of them naturally resets which
-    # chemicals are shown rather than carrying over an unrelated list.
-    widget_key = f"chem_pick_{crop_choice}_{category_choice}_{stage_filter or 'All'}"
-    chosen = st.multiselect(
-        "Chemicals to compare (pick one to start, add more to compare side by side)",
-        chemical_options, key=widget_key,
-    )
-
-    if not chosen:
-        st.info("Pick at least one chemical above to see the heatmap.")
-        st.stop()
-
-    fig = _build_heatmap(crop_df, target_col, chosen)
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption(EFFICIENCY_LEGEND)
-
-    with st.expander("Raw data for this crop/category"):
-        st.dataframe(
-            crop_df[["common_name", target_col, "efficiency"]].sort_values(["common_name", target_col]),
-            use_container_width=True, hide_index=True,
+    if company_choice:
+        fig, detail_df, _covered_n, _total_n = BOARDS_COV[board_choice](
+            crop_id, sheets, crop_stage_df, label_col, company_choice
         )
+        st.plotly_chart(fig, use_container_width=True)
+        if board_choice != "Fertilizer":
+            st.caption(EFFICIENCY_LEGEND)
+
+        if detail_df.empty:
+            st.info(f"No {board_choice.lower()} data for this crop.")
+        else:
+            with st.expander(f"{board_choice} detail table"):
+                st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+        analysis_style = st.radio(
+            "Analysis style", ["Concise", "Detailed"], index=0, horizontal=True,
+            key="cov_ai_style",
+            help="Concise: a few sentences per category plus one priority. "
+                 "Detailed: full walkthrough with rotation-risk and tier notes.",
+        )
+        if st.button("🤖 Analyze full coverage (Weed + Insect + Disease + Fertilizer)",
+                      key="cov_ai_button"):
+            with st.spinner("Analyzing coverage across all boards..."):
+                summary_text = build_full_coverage_summary(
+                    crop_id, sheets, crop_stage_df, label_col, crop_choice, company_choice
+                )
+                analysis = get_ai_analysis(summary_text, style=analysis_style)
+            st.markdown("#### AI Analysis")
+            st.markdown(analysis)
+            with st.expander("Raw summary sent to AI"):
+                st.text(summary_text)
+    else:
+        st.info("Select a company above to see its coverage.")

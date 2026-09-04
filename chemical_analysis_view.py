@@ -79,7 +79,15 @@ def _matrix_for_crop(matrix_df: pd.DataFrame, cfg: dict, crop_choice: str,
     """Rows for this crop only, with efficiency normalized. Returns
     empty if the sheet doesn't exist yet or has no rows for this crop.
     stage_filter, when given and cfg has a 'stage_col', narrows this to
-    only rows at that spray timing (e.g. only 'Early Post' rows)."""
+    only rows at that spray timing (e.g. only 'Early Post' rows).
+
+    Always guarantees 'common_name' and 'efficiency' columns exist on
+    the result, even if the underlying sheet is missing one of them
+    (e.g. efficiency hasn't been added to that category's sheet yet) —
+    downstream code (the heatmap, the raw-data table) can then safely
+    assume both columns are present rather than checking every time.
+    A genuinely missing efficiency column just means every row shows
+    as Unrated, same as a blank cell would."""
     target_col = cfg["target_col"]
     if matrix_df.empty or target_col not in matrix_df.columns or "crop" not in matrix_df.columns:
         return pd.DataFrame(columns=["crop", "common_name", target_col, "efficiency"])
@@ -87,6 +95,10 @@ def _matrix_for_crop(matrix_df: pd.DataFrame, cfg: dict, crop_choice: str,
     stage_col = cfg.get("stage_col")
     if stage_filter and stage_col and stage_col in df.columns:
         df = df[df[stage_col].astype(str).str.strip() == stage_filter]
+    if "efficiency" not in df.columns:
+        df["efficiency"] = pd.NA
+    if "common_name" not in df.columns:
+        df["common_name"] = pd.NA
     return df
 
 
@@ -127,7 +139,7 @@ def _build_heatmap(df: pd.DataFrame, target_col: str, chemicals: list) -> go.Fig
         y=list(reversed(chemicals)),
         text=text,
         texttemplate="%{text}",
-        textfont=dict(size=13),
+        textfont=dict(size=17),
         colorscale=_HEATMAP_COLORSCALE,
         zmin=0, zmax=5,
         showscale=False,
@@ -135,11 +147,18 @@ def _build_heatmap(df: pd.DataFrame, target_col: str, chemicals: list) -> go.Fig
         xgap=3, ygap=3,
     ))
     fig.update_layout(
-        height=max(200, 90 + 60 * len(chemicals)),
-        margin=dict(l=10, r=10, t=30, b=10),
-        xaxis=dict(tickfont=dict(size=13), side="top"),
-        yaxis=dict(tickfont=dict(size=14), automargin=True),
-        font=dict(size=13),
+        # Extra top margin/height headroom for the rotated, larger x-axis
+        # labels (weed/pest/disease names are often long) — automargin
+        # lets Plotly grow the margin further still if a name is
+        # especially long, rather than clipping it.
+        height=max(260, 160 + 60 * len(chemicals)),
+        margin=dict(l=10, r=10, t=140, b=10),
+        xaxis=dict(
+            tickfont=dict(size=17), side="top",
+            tickangle=-45, automargin=True,
+        ),
+        yaxis=dict(tickfont=dict(size=18), automargin=True),
+        font=dict(size=17),
     )
     return fig
 
@@ -224,7 +243,13 @@ def render_chemical_analysis_view():
     st.caption(EFFICIENCY_LEGEND)
 
     with st.expander("Raw data for this crop/category"):
+        # Belt-and-suspenders: only select columns that actually exist,
+        # even though _matrix_for_crop already guarantees common_name/
+        # efficiency are present — protects against any future column
+        # this expander might reference that isn't guaranteed yet.
+        display_cols = [c for c in ["common_name", target_col, "efficiency"] if c in crop_df.columns]
+        sort_cols = [c for c in ["common_name", target_col] if c in crop_df.columns]
         st.dataframe(
-            crop_df[["common_name", target_col, "efficiency"]].sort_values(["common_name", target_col]),
+            crop_df[display_cols].sort_values(sort_cols) if sort_cols else crop_df[display_cols],
             use_container_width=True, hide_index=True,
         )
