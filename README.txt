@@ -1,4 +1,4 @@
-SAC CROP DASHBOARD — FILE GUIDE
+CROP DASHBOARD — FILE GUIDE
 =================================
 Last major change: split one big app.py (~2,000 lines) into 6 smaller
 files so it's easier to navigate and edit. Behavior is identical to
