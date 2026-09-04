@@ -10,7 +10,7 @@ separate from weed_her/pest_ins/disease_fun so this feature can never
 affect the Crop Threat & Input chart's hover text, no matter how much
 data gets added here:
 
-  weed_matrix    : crop, common_name, weed_name, efficiency
+  weed_matrix    : crop, common_name, weed_name, weed_stage, efficiency
   insect_matrix  : crop, common_name, insect_name, efficiency
   disease_matrix : crop, common_name, disease_name, efficiency
 
@@ -18,6 +18,12 @@ data gets added here:
 column), not crop_id — kept simple for manual data entry. efficiency
 uses the same Excellent/Effective/Moderate/Poor/Ineffective scale as
 everywhere else; blank/missing shows as Unrated (gray), not assumed bad.
+
+weed_stage (Weed only — e.g. "Pre-emergence", "Early Post", "Late
+Post") is the spray timing, same concept as crop_weeds' weed_stage
+column used in the Price Comparison view's "Spray Timing" filter.
+Optional column: if it's missing from the sheet, the Weed board simply
+skips offering the timing filter rather than erroring.
 """
 
 import streamlit as st
@@ -28,7 +34,9 @@ from shared import EFFICIENCY_ORDER, EFFICIENCY_SCORE, normalize_efficiency, EFF
 from data_threat import DEFAULT_PATH_THREAT, load_workbook_threat, get_file_threat
 
 CHEMICAL_MATRIX_CONFIG = {
-    "Weed": {"sheet": "weed_matrix", "target_col": "weed_name"},
+    # stage_col is Weed-only, matching Price Comparison's pattern —
+    # intentionally absent from Insect/Disease below.
+    "Weed": {"sheet": "weed_matrix", "target_col": "weed_name", "stage_col": "weed_stage"},
     "Insect": {"sheet": "insect_matrix", "target_col": "insect_name"},
     "Disease": {"sheet": "disease_matrix", "target_col": "disease_name"},
 }
@@ -53,12 +61,32 @@ _HEATMAP_COLORSCALE = [
 ]
 
 
-def _matrix_for_crop(matrix_df: pd.DataFrame, target_col: str, crop_choice: str) -> pd.DataFrame:
+def _matrix_stage_options(matrix_df: pd.DataFrame, cfg: dict, crop_choice: str) -> list:
+    """Distinct spray-timing values (e.g. Pre-emergence/Early Post/Late
+    Post) for this crop, only meaningful when cfg has a 'stage_col'
+    (currently just Weed). Returns [] for categories without the
+    concept, or if the column isn't present in the sheet yet — the
+    caller treats an empty list as 'no timing filter to offer'."""
+    stage_col = cfg.get("stage_col")
+    if not stage_col or matrix_df.empty or stage_col not in matrix_df.columns or "crop" not in matrix_df.columns:
+        return []
+    df = matrix_df[matrix_df["crop"].astype(str).str.strip() == str(crop_choice).strip()]
+    return sorted({str(v).strip() for v in df[stage_col].dropna() if str(v).strip()})
+
+
+def _matrix_for_crop(matrix_df: pd.DataFrame, cfg: dict, crop_choice: str,
+                      stage_filter: str = None) -> pd.DataFrame:
     """Rows for this crop only, with efficiency normalized. Returns
-    empty if the sheet doesn't exist yet or has no rows for this crop."""
+    empty if the sheet doesn't exist yet or has no rows for this crop.
+    stage_filter, when given and cfg has a 'stage_col', narrows this to
+    only rows at that spray timing (e.g. only 'Early Post' rows)."""
+    target_col = cfg["target_col"]
     if matrix_df.empty or target_col not in matrix_df.columns or "crop" not in matrix_df.columns:
         return pd.DataFrame(columns=["crop", "common_name", target_col, "efficiency"])
     df = matrix_df[matrix_df["crop"].astype(str).str.strip() == str(crop_choice).strip()].copy()
+    stage_col = cfg.get("stage_col")
+    if stage_filter and stage_col and stage_col in df.columns:
+        df = df[df[stage_col].astype(str).str.strip() == stage_filter]
     return df
 
 
@@ -157,17 +185,31 @@ def render_chemical_analysis_view():
         )
         st.stop()
 
-    crop_df = _matrix_for_crop(matrix_df, target_col, crop_choice)
+    # Spray Timing (e.g. Pre-emergence / Early Post / Late Post) only
+    # exists for Weed, via weed_matrix's weed_stage column — other
+    # categories simply don't get this filter offered at all.
+    stage_options = _matrix_stage_options(matrix_df, cfg, crop_choice)
+    stage_filter = None
+    if stage_options:
+        stage_choice = st.selectbox(
+            "Spray Timing", ["All"] + stage_options, key="chem_stage"
+        )
+        stage_filter = None if stage_choice == "All" else stage_choice
+
+    crop_df = _matrix_for_crop(matrix_df, cfg, crop_choice, stage_filter=stage_filter)
     if crop_df.empty:
-        st.info(f"No {category_choice.lower()} chemical data found for {crop_choice} yet.")
+        if stage_filter:
+            st.info(f"No {category_choice.lower()} chemical data found for {crop_choice} at '{stage_filter}' timing yet.")
+        else:
+            st.info(f"No {category_choice.lower()} chemical data found for {crop_choice} yet.")
         st.stop()
 
     chemical_options = sorted(crop_df["common_name"].dropna().astype(str).str.strip().unique().tolist())
 
-    # Selection persists per (crop, category) combo via the widget key
-    # itself, so switching crop/category naturally resets which
+    # Selection persists per (crop, category, stage) combo via the
+    # widget key itself, so switching any of them naturally resets which
     # chemicals are shown rather than carrying over an unrelated list.
-    widget_key = f"chem_pick_{crop_choice}_{category_choice}"
+    widget_key = f"chem_pick_{crop_choice}_{category_choice}_{stage_filter or 'All'}"
     chosen = st.multiselect(
         "Chemicals to compare (pick one to start, add more to compare side by side)",
         chemical_options, key=widget_key,
