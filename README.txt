@@ -1,4 +1,4 @@
-SAC CROP DASHBOARD — FILE GUIDE
+CROP DASHBOARD — FILE GUIDE
 =================================
 Current structure: 8 files, 4 pages (sidebar views). Last major
 addition: Chemical Analysis page + its supporting data_threat.py loader.
