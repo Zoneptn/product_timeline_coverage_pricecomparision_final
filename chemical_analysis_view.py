@@ -1,8 +1,8 @@
 """
-Chemical Analysis view — a heatmap answering "how does chemical X
-perform against every weed/pest/disease on this crop?", built by
-picking chemicals one at a time so you can compare a handful side by
-side rather than seeing everything at once.
+Chemical Analysis view — a heatmap answering "does chemical X work
+against every weed/pest/disease on this crop?", built by picking
+chemicals one at a time so you can compare a handful side by side
+rather than seeing everything at once.
 
 Reads crop_timeline.xlsx (via data_threat.py), 3 dedicated long/tidy
 sheets — one row per (chemical, target) pairing, kept deliberately
@@ -10,14 +10,15 @@ separate from weed_her/pest_ins/disease_fun so this feature can never
 affect the Crop Threat & Input chart's hover text, no matter how much
 data gets added here:
 
-  weed_matrix    : crop, common_name, weed_name, weed_stage, efficiency
-  insect_matrix  : crop, common_name, insect_name, efficiency
-  disease_matrix : crop, common_name, disease_name, efficiency
+  weed_matrix    : crop, common_name, weed_name, weed_stage, effectiveness
+  insect_matrix  : crop, common_name, insect_name, effectiveness
+  disease_matrix : crop, common_name, disease_name, effectiveness
 
 "crop" is the crop's display NAME (matching crop_stage's "crop"
-column), not crop_id — kept simple for manual data entry. efficiency
-uses the same Excellent/Effective/Moderate/Poor/Ineffective scale as
-everywhere else; blank/missing shows as Unrated (gray), not assumed bad.
+column), not crop_id — kept simple for manual data entry. effectiveness
+is deliberately binary — Yes or No — after the team found a finer-
+grained scale too hard to assess consistently; blank/missing shows as
+Unrated (gray), not assumed No.
 
 weed_stage (Weed only — e.g. "Pre-emergence", "Early Post", "Late
 Post") is the spray timing, same concept as crop_weeds' weed_stage
@@ -30,7 +31,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
-from shared import EFFICIENCY_ORDER, EFFICIENCY_SCORE, normalize_efficiency, EFFICIENCY_LEGEND
+from shared import EFFECTIVENESS_ORDER, EFFECTIVENESS_SCORE, normalize_effectiveness, EFFECTIVENESS_LEGEND
 from data_threat import DEFAULT_PATH_THREAT, load_workbook_threat, get_file_threat
 
 CHEMICAL_MATRIX_CONFIG = {
@@ -41,23 +42,16 @@ CHEMICAL_MATRIX_CONFIG = {
     "Disease": {"sheet": "disease_matrix", "target_col": "disease_name"},
 }
 
-# Diverging-by-name (not by number) colorscale so the color at each
-# score lines up with the badge colors used everywhere else in the app
-# (Excellent=green ... Ineffective=red), with a distinct gray for
-# Unrated so "not yet rated" never looks like "confirmed bad".
+# 3 discrete levels only (No / Unrated / Yes), matching EFFECTIVENESS_SCORE
+# (0/1/2) — a flat-then-jump colorscale rather than a smooth gradient, so
+# each cell reads as one of exactly 3 clear colors, not a blend.
 _HEATMAP_COLORSCALE = [
-    [0.00, "#BDBDBD"],   # 0 - Unrated
-    [0.20, "#BDBDBD"],
-    [0.20, "#E63946"],   # 1 - Ineffective
-    [0.40, "#E63946"],
-    [0.40, "#F4A261"],   # 2 - Poor
-    [0.60, "#F4A261"],
-    [0.60, "#F6D55C"],   # 3 - Moderate
-    [0.80, "#F6D55C"],
-    [0.80, "#8FCB89"],   # 4 - Effective
-    [0.90, "#8FCB89"],
-    [0.90, "#2A9D8F"],   # 5 - Excellent
-    [1.00, "#2A9D8F"],
+    [0.000, "#E63946"],  # 0 - No
+    [0.333, "#E63946"],
+    [0.333, "#BDBDBD"],  # 1 - Unrated
+    [0.667, "#BDBDBD"],
+    [0.667, "#2A9D8F"],  # 2 - Yes
+    [1.000, "#2A9D8F"],
 ]
 
 
@@ -76,27 +70,27 @@ def _matrix_stage_options(matrix_df: pd.DataFrame, cfg: dict, crop_choice: str) 
 
 def _matrix_for_crop(matrix_df: pd.DataFrame, cfg: dict, crop_choice: str,
                       stage_filter: str = None) -> pd.DataFrame:
-    """Rows for this crop only, with efficiency normalized. Returns
+    """Rows for this crop only, with effectiveness normalized. Returns
     empty if the sheet doesn't exist yet or has no rows for this crop.
     stage_filter, when given and cfg has a 'stage_col', narrows this to
     only rows at that spray timing (e.g. only 'Early Post' rows).
 
-    Always guarantees 'common_name' and 'efficiency' columns exist on
+    Always guarantees 'common_name' and 'effectiveness' columns exist on
     the result, even if the underlying sheet is missing one of them
-    (e.g. efficiency hasn't been added to that category's sheet yet) —
-    downstream code (the heatmap, the raw-data table) can then safely
-    assume both columns are present rather than checking every time.
-    A genuinely missing efficiency column just means every row shows
+    (e.g. effectiveness hasn't been added to that category's sheet yet)
+    — downstream code (the heatmap, the raw-data table) can then safely
+    assume both columns are present rather than checking every time. A
+    genuinely missing effectiveness column just means every row shows
     as Unrated, same as a blank cell would."""
     target_col = cfg["target_col"]
     if matrix_df.empty or target_col not in matrix_df.columns or "crop" not in matrix_df.columns:
-        return pd.DataFrame(columns=["crop", "common_name", target_col, "efficiency"])
+        return pd.DataFrame(columns=["crop", "common_name", target_col, "effectiveness"])
     df = matrix_df[matrix_df["crop"].astype(str).str.strip() == str(crop_choice).strip()].copy()
     stage_col = cfg.get("stage_col")
     if stage_filter and stage_col and stage_col in df.columns:
         df = df[df[stage_col].astype(str).str.strip() == stage_filter]
-    if "efficiency" not in df.columns:
-        df["efficiency"] = pd.NA
+    if "effectiveness" not in df.columns:
+        df["effectiveness"] = pd.NA
     if "common_name" not in df.columns:
         df["common_name"] = pd.NA
     return df
@@ -119,16 +113,16 @@ def _build_heatmap(df: pd.DataFrame, target_col: str, chemicals: list) -> go.Fig
     for _, r in df.iterrows():
         chem = str(r.get("common_name", "")).strip()
         tgt = str(r.get(target_col, "")).strip()
-        eff = normalize_efficiency(r.get("efficiency")) or "Unrated"
+        eff = normalize_effectiveness(r.get("effectiveness")) or "Unrated"
         lookup[(chem, tgt)] = eff
 
-    z = []       # numeric score per cell, for coloring
+    z = []       # numeric score per cell (0/1/2), for coloring
     text = []    # rating word per cell, for the label/hover
     for chem in reversed(chemicals):  # reversed so first-picked ends up on top
         row_z, row_text = [], []
         for tgt in targets:
             eff = lookup.get((chem.strip(), tgt), "Unrated")
-            row_z.append(EFFICIENCY_SCORE[eff])
+            row_z.append(EFFECTIVENESS_SCORE[eff])
             row_text.append(eff)
         z.append(row_z)
         text.append(row_text)
@@ -141,7 +135,7 @@ def _build_heatmap(df: pd.DataFrame, target_col: str, chemicals: list) -> go.Fig
         texttemplate="%{text}",
         textfont=dict(size=17),
         colorscale=_HEATMAP_COLORSCALE,
-        zmin=0, zmax=5,
+        zmin=0, zmax=2,
         showscale=False,
         hovertemplate="<b>%{y}</b> vs <b>%{x}</b><br>%{text}<extra></extra>",
         xgap=3, ygap=3,
@@ -200,7 +194,7 @@ def render_chemical_analysis_view():
     if matrix_df.empty or cfg["sheet"] not in sheets:
         st.info(
             f"No `{cfg['sheet']}` sheet found yet in the workbook. Add it with columns "
-            f"`crop, common_name, {target_col}, efficiency` to use this page for {category_choice.lower()}s."
+            f"`crop, common_name, {target_col}, effectiveness` to use this page for {category_choice.lower()}s."
         )
         st.stop()
 
@@ -240,14 +234,14 @@ def render_chemical_analysis_view():
 
     fig = _build_heatmap(crop_df, target_col, chosen)
     st.plotly_chart(fig, use_container_width=True)
-    st.caption(EFFICIENCY_LEGEND)
+    st.caption(EFFECTIVENESS_LEGEND)
 
     with st.expander("Raw data for this crop/category"):
         # Belt-and-suspenders: only select columns that actually exist,
         # even though _matrix_for_crop already guarantees common_name/
-        # efficiency are present — protects against any future column
+        # effectiveness are present — protects against any future column
         # this expander might reference that isn't guaranteed yet.
-        display_cols = [c for c in ["common_name", target_col, "efficiency"] if c in crop_df.columns]
+        display_cols = [c for c in ["common_name", target_col, "effectiveness"] if c in crop_df.columns]
         sort_cols = [c for c in ["common_name", target_col] if c in crop_df.columns]
         st.dataframe(
             crop_df[display_cols].sort_values(sort_cols) if sort_cols else crop_df[display_cols],

@@ -1,26 +1,27 @@
 """
 Loading/caching for crop_timeline.xlsx. Shared by threat_view.py (the
 Crop Threat & Input board) and chemical_analysis_view.py (the chemical
-efficiency heatmap) since both read the exact same workbook.
+effectiveness heatmap) since both read the exact same workbook.
 
-Sheet list includes the 3 chemical-efficiency-matrix sheets
+Sheet list includes the 3 chemical-effectiveness-matrix sheets
 (weed_matrix / insect_matrix / disease_matrix) used only by
 chemical_analysis_view.py — they're loaded here regardless so both
 modules share one cache, but threat_view.py never looks at them. Each
 matrix sheet is long/tidy format, one row per (chemical, target) pairing:
 
-  weed_matrix    : crop, common_name, weed_name, efficiency
-  insect_matrix  : crop, common_name, insect_name, efficiency
-  disease_matrix : crop, common_name, disease_name, efficiency
+  weed_matrix    : crop, common_name, weed_name, weed_stage, effectiveness
+  insect_matrix  : crop, common_name, insect_name, effectiveness
+  disease_matrix : crop, common_name, disease_name, effectiveness
 
 "crop" here is the crop's display NAME (matching crop_stage's "crop"
 column), not crop_id — kept simple for manual data entry since whoever
-fills this in shouldn't need to know internal ID numbers. efficiency
-uses the same Excellent/Effective/Moderate/Poor/Ineffective scale as
-everywhere else (see shared.py); blank shows as Unrated. These sheets
-are entirely optional — if they don't exist yet, they load as empty
-DataFrames and chemical_analysis_view.py shows an appropriate "no data
-yet" message rather than erroring.
+fills this in shouldn't need to know internal ID numbers. effectiveness
+is Yes/No (see shared.py); blank shows as Unrated. weed_stage (Weed
+only — e.g. "Pre-emergence"/"Early Post"/"Late Post") is optional and
+powers the Spray Timing filter on the Chemical Analysis page. These
+sheets are entirely optional — if they don't exist yet, they load as
+empty DataFrames and chemical_analysis_view.py shows an appropriate "no
+data yet" message rather than erroring.
 """
 
 import os

@@ -65,13 +65,73 @@ def normalize_tier(val) -> str:
 
 
 # =====================================================================
-# Efficiency lives on the JUNCTION sheets (weed_her / pest_ins /
-# disease_fun in crop_timeline_coverage.xlsx, and the equivalent sheets
-# in crop_timeline.xlsx) — not the product master sheets. A product's
-# real-world efficiency varies by which pest/weed/disease it's up
-# against (e.g. Chemical A might be Excellent against Pest A but only
-# Moderate against Pest B), so it belongs at the product-x-target
-# pairing, the same place trade_name/common_name already sits.
+# Effectiveness (this section) is used ONLY by chemical_analysis_view.py
+# (the weed_matrix/insect_matrix/disease_matrix sheets) — deliberately
+# binary Yes/No, since the team found a finer scale too hard to assess
+# consistently for that quick-comparison heatmap. Everywhere else in the
+# app — Coverage boards, Threat & Input hover, Price Comparison, AI
+# analysis — still uses the 5-point EFFICIENCY_* scale further below.
+# =====================================================================
+
+EFFECTIVENESS_ORDER = ["Yes", "No"]
+EFFECTIVENESS_BADGE = {
+    "Yes": "✅ Yes",
+    "No": "❌ No",
+    "Unrated": "❔ Unrated",
+}
+EFFECTIVENESS_ALIASES = {
+    "yes": "Yes", "y": "Yes", "true": "Yes", "1": "Yes",
+    "effective": "Yes", "good": "Yes", "excellent": "Yes", "works": "Yes",
+    "no": "No", "n": "No", "false": "No", "0": "No",
+    "ineffective": "No", "poor": "No", "not effective": "No", "doesn't work": "No",
+}
+
+
+def normalize_effectiveness(val):
+    """Returns 'Yes'/'No', or None if blank/unrecognized (caller decides
+    how to label that — see 'Unrated' usage below). Used only by
+    chemical_analysis_view.py."""
+    if pd.isna(val):
+        return None
+    raw = str(val).strip()
+    if not raw:
+        return None
+    key = raw.lower().replace("_", "-").replace("  ", " ")
+    if key in EFFECTIVENESS_ALIASES:
+        return EFFECTIVENESS_ALIASES[key]
+    title = raw.title()
+    return title if title in EFFECTIVENESS_ORDER else None
+
+
+# Shown as a caption under the Chemical Analysis heatmap so the badges
+# have a clear, consistent meaning rather than being left to guesswork.
+EFFECTIVENESS_LEGEND = (
+    "✅ **Yes** — effective against this target | "
+    "❌ **No** — not effective | "
+    "❔ **Unrated** — not yet assessed"
+)
+
+# Numeric score for heatmap coloring (chemical_analysis_view.py) — 3
+# distinct levels so Unrated renders visibly different (gray) from a
+# confirmed No (red), rather than the two being visually confused.
+EFFECTIVENESS_SCORE = {
+    "Yes": 2,
+    "Unrated": 1,
+    "No": 0,
+}
+
+
+# =====================================================================
+# Efficiency (5-point scale) lives on the JUNCTION sheets (weed_her /
+# pest_ins / disease_fun in crop_timeline_coverage.xlsx, and the
+# equivalent sheets in crop_timeline.xlsx) — not the product master
+# sheets. A product's real-world efficiency varies by which pest/weed/
+# disease it's up against (e.g. Chemical A might be Excellent against
+# Pest A but only Moderate against Pest B), so it belongs at the
+# product-x-target pairing, the same place trade_name/common_name
+# already sits. Used by Coverage boards, Threat & Input hover, Price
+# Comparison, and the AI analysis — NOT by chemical_analysis_view.py,
+# which uses the separate binary EFFECTIVENESS_* system above instead.
 #
 # Expected values: Excellent / Effective / Moderate / Poor / Ineffective
 # (5-point scale). Unlike tier, a blank/unrecognized value normalizes to
@@ -127,18 +187,6 @@ EFFICIENCY_LEGEND = (
     "🟠 **Poor** 40–59% control | "
     "🔴 **Ineffective** <40% control"
 )
-
-# Numeric score for heatmap coloring (chemical_analysis_view.py) — higher
-# is better. 0 for Unrated/unknown so it renders distinctly gray rather
-# than being mistaken for a genuinely bad (Ineffective) rating.
-EFFICIENCY_SCORE = {
-    "Excellent": 5,
-    "Effective": 4,
-    "Moderate": 3,
-    "Poor": 2,
-    "Ineffective": 1,
-    "Unrated": 0,
-}
 
 
 # =====================================================================
