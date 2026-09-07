@@ -16,9 +16,9 @@ data gets added here:
 
 "crop" is the crop's display NAME (matching crop_stage's "crop"
 column), not crop_id — kept simple for manual data entry. effectiveness
-is deliberately binary — Yes or No — after the team found a finer-
-grained scale too hard to assess consistently; blank/missing shows as
-Unrated (gray), not assumed No.
+is Effective / Moderate / Ineffective — a 3-point scale, after the team
+first tried binary Yes/No and found it too coarse for this heatmap;
+blank/missing shows as Unrated (gray), not assumed Ineffective.
 
 weed_stage (Weed only — e.g. "Pre-emergence", "Early Post", "Late
 Post") is the spray timing, same concept as crop_weeds' weed_stage
@@ -42,16 +42,19 @@ CHEMICAL_MATRIX_CONFIG = {
     "Disease": {"sheet": "disease_matrix", "target_col": "disease_name"},
 }
 
-# 3 discrete levels only (No / Unrated / Yes), matching EFFECTIVENESS_SCORE
-# (0/1/2) — a flat-then-jump colorscale rather than a smooth gradient, so
-# each cell reads as one of exactly 3 clear colors, not a blend.
+# 4 discrete levels (Unrated / Ineffective / Moderate / Effective),
+# matching EFFECTIVENESS_SCORE (0/1/2/3) — a flat-then-jump colorscale
+# rather than a smooth gradient, so each cell reads as one of exactly 4
+# clear colors, not a blend.
 _HEATMAP_COLORSCALE = [
-    [0.000, "#E63946"],  # 0 - No
-    [0.333, "#E63946"],
-    [0.333, "#BDBDBD"],  # 1 - Unrated
-    [0.667, "#BDBDBD"],
-    [0.667, "#2A9D8F"],  # 2 - Yes
-    [1.000, "#2A9D8F"],
+    [0.00, "#BDBDBD"],  # 0 - Unrated
+    [0.25, "#BDBDBD"],
+    [0.25, "#E63946"],  # 1 - Ineffective
+    [0.50, "#E63946"],
+    [0.50, "#F6D55C"],  # 2 - Moderate
+    [0.75, "#F6D55C"],
+    [0.75, "#2A9D8F"],  # 3 - Effective
+    [1.00, "#2A9D8F"],
 ]
 
 
@@ -135,7 +138,7 @@ def _build_heatmap(df: pd.DataFrame, target_col: str, chemicals: list) -> go.Fig
         texttemplate="%{text}",
         textfont=dict(size=17),
         colorscale=_HEATMAP_COLORSCALE,
-        zmin=0, zmax=2,
+        zmin=0, zmax=3,
         showscale=False,
         hovertemplate="<b>%{y}</b> vs <b>%{x}</b><br>%{text}<extra></extra>",
         xgap=3, ygap=3,

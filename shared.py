@@ -66,31 +66,37 @@ def normalize_tier(val) -> str:
 
 # =====================================================================
 # Effectiveness (this section) is used ONLY by chemical_analysis_view.py
-# (the weed_matrix/insect_matrix/disease_matrix sheets) — deliberately
-# binary Yes/No, since the team found a finer scale too hard to assess
-# consistently for that quick-comparison heatmap. Everywhere else in the
-# app — Coverage boards, Threat & Input hover, Price Comparison, AI
-# analysis — still uses the 5-point EFFICIENCY_* scale further below.
+# (the weed_matrix/insect_matrix/disease_matrix sheets) — a 3-point
+# scale (Effective/Moderate/Ineffective), settled on after the team
+# first tried binary Yes/No and found it too coarse for the heatmap.
+# Everywhere else in the app — Coverage boards, Threat & Input hover,
+# Price Comparison, AI analysis — still uses the separate 5-point
+# EFFICIENCY_* scale further below; the two systems are independent.
 # =====================================================================
 
-EFFECTIVENESS_ORDER = ["Yes", "No"]
+EFFECTIVENESS_ORDER = ["Effective", "Moderate", "Ineffective"]
 EFFECTIVENESS_BADGE = {
-    "Yes": "✅ Yes",
-    "No": "❌ No",
+    "Effective": "🟢 Effective",
+    "Moderate": "🟡 Moderate",
+    "Ineffective": "🔴 Ineffective",
     "Unrated": "❔ Unrated",
 }
 EFFECTIVENESS_ALIASES = {
-    "yes": "Yes", "y": "Yes", "true": "Yes", "1": "Yes",
-    "effective": "Yes", "good": "Yes", "excellent": "Yes", "works": "Yes",
-    "no": "No", "n": "No", "false": "No", "0": "No",
-    "ineffective": "No", "poor": "No", "not effective": "No", "doesn't work": "No",
+    "effective": "Effective", "yes": "Effective", "good": "Effective",
+    "excellent": "Effective", "strong": "Effective", "high": "Effective",
+    "very good": "Effective", "works": "Effective",
+    "moderate": "Moderate", "average": "Moderate", "medium": "Moderate",
+    "fair": "Moderate", "ok": "Moderate", "okay": "Moderate", "so-so": "Moderate",
+    "ineffective": "Ineffective", "no": "Ineffective", "poor": "Ineffective",
+    "weak": "Ineffective", "low": "Ineffective", "none": "Ineffective",
+    "not effective": "Ineffective", "doesn't work": "Ineffective",
 }
 
 
 def normalize_effectiveness(val):
-    """Returns 'Yes'/'No', or None if blank/unrecognized (caller decides
-    how to label that — see 'Unrated' usage below). Used only by
-    chemical_analysis_view.py."""
+    """Returns 'Effective'/'Moderate'/'Ineffective', or None if blank/
+    unrecognized (caller decides how to label that — see 'Unrated'
+    usage below). Used only by chemical_analysis_view.py."""
     if pd.isna(val):
         return None
     raw = str(val).strip()
@@ -106,18 +112,21 @@ def normalize_effectiveness(val):
 # Shown as a caption under the Chemical Analysis heatmap so the badges
 # have a clear, consistent meaning rather than being left to guesswork.
 EFFECTIVENESS_LEGEND = (
-    "✅ **Yes** — effective against this target | "
-    "❌ **No** — not effective | "
+    "🟢 **Effective** — works well against this target | "
+    "🟡 **Moderate** — partially effective | "
+    "🔴 **Ineffective** — doesn't work | "
     "❔ **Unrated** — not yet assessed"
 )
 
-# Numeric score for heatmap coloring (chemical_analysis_view.py) — 3
+# Numeric score for heatmap coloring (chemical_analysis_view.py) — 4
 # distinct levels so Unrated renders visibly different (gray) from a
-# confirmed No (red), rather than the two being visually confused.
+# confirmed Ineffective (red), rather than the two being visually
+# confused.
 EFFECTIVENESS_SCORE = {
-    "Yes": 2,
-    "Unrated": 1,
-    "No": 0,
+    "Effective": 3,
+    "Moderate": 2,
+    "Ineffective": 1,
+    "Unrated": 0,
 }
 
 
