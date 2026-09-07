@@ -174,56 +174,59 @@ def _companies_for_category(sheets: dict, cfg: dict) -> list:
     return sorted({str(c).strip() for c in master["company"].dropna() if str(c).strip()})
 
 
-def _portfolio_cost_table(sheets: dict, cfg: dict, crop_id, target_ids: list,
-                           target_names: dict, companies: list):
-    """For each selected company, sums the CHEAPEST available product's
-    cost across all selected targets — a company's own total is only
-    ever built from real per-target lookups already used elsewhere
-    (_price_comparison_table), so this never invents a price. A company
-    missing a product for one or more targets still gets a partial
-    total (sum of whatever it does cover) plus a 'missing' count/list,
-    rather than being silently dropped or blocked from showing anything
-    at all — a real gap is exactly the kind of thing this view exists
-    to surface. NOT for combining categories: units differ (per rai vs
-    per 20L tank), so target_ids must all come from the SAME category.
-
-    IMPORTANT — one product commonly covers MULTIPLE targets (a
-    broad-spectrum product handling several pests). If it's picked as
-    the cheapest option for more than one selected target, its cost is
-    counted ONCE in the total, not once per target — you'd only
-    actually buy it once. Deduplication is by (company, trade_name),
-    since that's the identity already available from
-    _price_comparison_table's output.
-
-    Returns (summary_df, breakdown_df). breakdown_df is long-format,
-    one row per (company, target) — the per-target detail behind each
-    summary total, for a line-item drill-down. When a product repeats
-    across targets for the same company, only its FIRST occurrence
-    (in target order) carries a cost; later occurrences show cost=None
-    with a note explaining it's the same product already counted —
-    this way, naively summing breakdown_df's cost column for one
-    company matches that company's total_cost exactly, rather than
-    silently double-counting shared products."""
-    # Reuses the existing per-target lookup (_price_comparison_table)
-    # rather than re-deriving costs — one call per target, keeping each
-    # company's cheapest PRODUCT (not just its cost) for that target, so
-    # the same product picked for multiple targets can be recognized and
-    # deduped below.
-    per_target_company_pick = {}  # target_id -> {company: (trade_name, cost)}
+def _portfolio_target_options(sheets: dict, cfg: dict, crop_id, target_ids: list) -> dict:
+    """Every available product option per (company, target) pair, sorted
+    cheapest first — the raw material behind both the auto-cheapest
+    default and the optional manual override (see 'Customize product
+    picks' in _render_portfolio_cost). Reuses _price_comparison_table
+    per target, same as before, just keeping every row instead of
+    collapsing straight to the cheapest one."""
+    options = {}  # (company, target_id) -> [(trade_name, cost), ...] sorted by cost asc
     for tid in target_ids:
         t = _price_comparison_table(sheets, cfg, crop_id, tid, ascending=True)
         if t.empty:
-            per_target_company_pick[tid] = {}
             continue
         t = t.copy()
         t["_cost_num"] = pd.to_numeric(t[cfg["cost_col"]], errors="coerce")
         t_valid = t.dropna(subset=["_cost_num"])
-        picks = {}
         for company, g in t_valid.groupby("company"):
-            best_row = g.loc[g["_cost_num"].idxmin()]
-            picks[company] = (best_row["trade_name"], best_row["_cost_num"])
-        per_target_company_pick[tid] = picks
+            pairs = sorted(zip(g["trade_name"], g["_cost_num"]), key=lambda p: p[1])
+            options[(company, tid)] = pairs
+    return options
 
+
+def _default_picks(all_options: dict) -> dict:
+    """Cheapest option per (company, target) combo — used as-is when
+    'Customize product picks' is off, and as the starting point for any
+    combo the user hasn't manually overridden when it's on."""
+    return {key: opts[0] for key, opts in all_options.items() if opts}
+
+
+def _resolve_portfolio(target_ids: list, target_names: dict, companies: list, picks: dict):
+    """picks: {(company, target_id): (trade_name, cost)} — the resolved
+    product for every combo that has one (auto-cheapest or a manual
+    override); a combo simply absent from picks is treated as a gap
+    (no product for that target). Shared by both the default and
+    'Customize product picks' paths so the totals/breakdown logic can
+    never diverge between the two — same summing and same dedup rule
+    either way.
+
+    IMPORTANT — one product commonly covers MULTIPLE targets (a
+    broad-spectrum product handling several pests). If the resolved
+    pick for more than one selected target turns out to be the SAME
+    product for a given company, its cost is counted ONCE in the
+    total, not once per target — you'd only actually buy it once.
+    Deduplication is by (company, trade_name).
+
+    Returns (summary_df, breakdown_df). breakdown_df is long-format,
+    one row per (company, target) — the per-target detail behind each
+    summary total. When a product repeats across targets for the same
+    company, only its FIRST occurrence (in target order) carries a
+    cost; later occurrences show cost=None with a note explaining it's
+    the same product already counted — this way, naively summing
+    breakdown_df's cost column for one company matches that company's
+    total_cost exactly, rather than silently double-counting shared
+    products."""
     n_targets = len(target_ids)
     rows = []
     breakdown_rows = []
@@ -234,7 +237,7 @@ def _portfolio_cost_table(sheets: dict, cfg: dict, crop_id, target_ids: list,
         seen_products = set()
         for tid in target_ids:
             tname = target_names.get(tid, str(tid))
-            pick = per_target_company_pick.get(tid, {}).get(company)
+            pick = picks.get((company, tid))
             if pick is not None:
                 trade_name, cost = pick
                 products_used[trade_name] = cost
@@ -540,12 +543,13 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
     st.caption(
         "Pick several targets in ONE category — see each company's total "
         "cost to cover all of them (using their cheapest product per "
-        "target), plus a flag for anyone missing coverage on one or more. "
-        "If one product covers multiple selected targets, its cost is "
-        "only counted once, not once per target. Note: this can't yet mix "
-        "categories into one number, since ฿/rai (Herbicide) and ฿/20L "
-        "tank (Insecticide/Fungicide) aren't the same unit — pick one "
-        "category per comparison for now."
+        "target by default — see 'Customize product picks' below to "
+        "choose a different one), plus a flag for anyone missing "
+        "coverage on one or more. If one product covers multiple "
+        "selected targets, its cost is only counted once, not once per "
+        "target. Note: this can't yet mix categories into one number, "
+        "since ฿/rai (Herbicide) and ฿/20L tank (Insecticide/Fungicide) "
+        "aren't the same unit — pick one category per comparison for now."
     )
 
     stage_df_all = sheets["crop_stage"]
@@ -610,7 +614,42 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
         st.info("Pick at least one company above to compare.")
         return
 
-    table, breakdown_df = _portfolio_cost_table(sheets, cfg, crop_id, target_ids, target_names, companies_choice)
+    all_options = _portfolio_target_options(sheets, cfg, crop_id, target_ids)
+    picks = _default_picks(all_options)
+
+    # Customize product picks — off by default (auto-cheapest, exactly
+    # as before). When on, only (company, target) combos that actually
+    # HAVE more than one product option get a dropdown — no point
+    # showing a picker where there's nothing to choose between. Picks
+    # made here are collected into `picks` and immediately feed the
+    # summary/breakdown below, since Streamlit reruns top-to-bottom on
+    # every widget interaction and a selectbox's return value already
+    # reflects the latest choice at the point it's read.
+    customize = st.checkbox(
+        "Customize product picks", key="pf_customize",
+        help="Off: automatically uses each company's cheapest product per target. "
+             "On: shows a dropdown (defaulting to cheapest) for any company/target "
+             "that has more than one product option, so you can pick a different one.",
+    )
+    if customize:
+        any_adjustable = False
+        for company in companies_choice:
+            adjustable_targets = [tid for tid in target_ids if len(all_options.get((company, tid), [])) > 1]
+            if not adjustable_targets:
+                continue
+            any_adjustable = True
+            with st.expander(f"🔧 Adjust picks — {company}"):
+                for tid in adjustable_targets:
+                    tname = target_names[tid]
+                    opts = all_options[(company, tid)]
+                    labels = [f"{tn} — {_format_price(c)}/{cfg['cost_unit_label']}" for tn, c in opts]
+                    pick_key = f"pf_pick_{company}_{tid}"
+                    chosen_label = st.selectbox(tname, labels, key=pick_key)
+                    picks[(company, tid)] = opts[labels.index(chosen_label)]
+        if not any_adjustable:
+            st.caption("No company/target in this selection has more than one product option to choose between.")
+
+    table, breakdown_df = _resolve_portfolio(target_ids, target_names, companies_choice, picks)
     if table.empty:
         st.info("No data to show for this selection.")
         return
