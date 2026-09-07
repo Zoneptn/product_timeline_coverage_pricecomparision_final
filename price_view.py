@@ -44,6 +44,50 @@ PRICE_CATEGORY_CONFIG = {
     },
 }
 
+# Canonical spray-timing order — a weed's timings follow the natural
+# agronomic sequence within a season (pre-emergence happens before any
+# post-emergence treatment; early post before late post), so this
+# should drive sorting/grouping wherever Spray Timing appears, not
+# alphabetical order (which would incorrectly put "Early Post" before
+# "Late Post" but "Late Post" before "Pre-emergence"). Aliases cover
+# common real-world spelling variants; anything genuinely unrecognized
+# still sorts in — just placed after the three known stages, rather
+# than being dropped or crashing.
+SPRAY_TIMING_ORDER = ["Pre-emergence", "Early Post", "Late Post"]
+_SPRAY_TIMING_ALIASES = {
+    "pre-emergence": "Pre-emergence", "pre emergence": "Pre-emergence",
+    "preemergence": "Pre-emergence", "pre": "Pre-emergence",
+    "early post": "Early Post", "early post-emergence": "Early Post",
+    "early postemergence": "Early Post", "early-post": "Early Post", "early": "Early Post",
+    "late post": "Late Post", "late post-emergence": "Late Post",
+    "late postemergence": "Late Post", "late-post": "Late Post", "late": "Late Post",
+}
+
+
+def _normalize_spray_timing(timing) -> str:
+    """Maps a raw spray-timing string to its canonical label
+    (Pre-emergence/Early Post/Late Post) when recognized; returns the
+    original (stripped) text unchanged when it isn't a known variant,
+    so unusual data still displays as-typed rather than being silently
+    dropped or blanked."""
+    if not timing:
+        return ""
+    raw = str(timing).strip()
+    key = raw.lower().replace("_", "-").replace("  ", " ")
+    return _SPRAY_TIMING_ALIASES.get(key, raw)
+
+
+def _spray_timing_sort_key(timing):
+    """Sort key placing timings in the canonical Pre-emergence -> Early
+    Post -> Late Post order. Blank/None sorts into the same bucket as
+    genuinely unrecognized values — after the three known stages,
+    alphabetically among themselves — rather than erroring or randomly
+    interleaving with the known sequence."""
+    canonical = _normalize_spray_timing(timing)
+    if canonical in SPRAY_TIMING_ORDER:
+        return (0, SPRAY_TIMING_ORDER.index(canonical))
+    return (1, canonical)
+
 
 def _price_stage_options(sheets: dict, cfg: dict, crop_id) -> list:
     """Distinct spray-timing values (e.g. Early Post/Late Post) for this
@@ -58,7 +102,8 @@ def _price_stage_options(sheets: dict, cfg: dict, crop_id) -> list:
     if window_df.empty or stage_col not in window_df.columns:
         return []
     w = window_df[window_df["crop_id"] == crop_id]
-    return sorted({str(v).strip() for v in w[stage_col].dropna() if str(v).strip()})
+    values = {str(v).strip() for v in w[stage_col].dropna() if str(v).strip()}
+    return sorted(values, key=_spray_timing_sort_key)
 
 
 def _price_target_options(sheets: dict, cfg: dict, crop_id, stage_filter: str = None) -> pd.DataFrame:
@@ -204,7 +249,20 @@ def _price_comparison_table(sheets: dict, cfg: dict, crop_id, target_id,
         rows.append(row)
     out = pd.DataFrame(rows, columns=empty_cols + ["best_efficiency"])
     out["_sort_cost"] = pd.to_numeric(out[cfg["cost_col"]], errors="coerce")
-    out = out.sort_values("_sort_cost", ascending=ascending, na_position="last").drop(columns=["_sort_cost"])
+    # When multiple distinct timings are present (i.e. 'All' was
+    # selected for Herbicide), group rows by timing FIRST — in the
+    # canonical Pre-emergence -> Early Post -> Late Post order, not
+    # alphabetically or interleaved by price — with cost as the
+    # secondary sort within each timing group. A single-timing result
+    # (a specific timing was chosen, or no stage concept at all) keeps
+    # the original pure cost-based sort, since there's nothing to group.
+    if has_stage and out["spray_timing"].nunique() > 1:
+        out["_sort_timing"] = out["spray_timing"].apply(_spray_timing_sort_key)
+        out = out.sort_values(
+            ["_sort_timing", "_sort_cost"], ascending=[True, ascending], na_position="last"
+        ).drop(columns=["_sort_timing", "_sort_cost"])
+    else:
+        out = out.sort_values("_sort_cost", ascending=ascending, na_position="last").drop(columns=["_sort_cost"])
     return out.reset_index(drop=True)
 
 
@@ -252,6 +310,14 @@ def _portfolio_treatment_windows(sheets: dict, cfg: dict, crop_id, target_ids: l
     cheapest — picking only the cheapest would silently skip a spray
     application the crop actually needs.
 
+    Ordering: when 'All' is selected, the result is grouped by TIMING
+    first (in the canonical Pre-emergence -> Early Post -> Late Post
+    order), with every selected weed nested under each timing — i.e.
+    all weeds needing a Pre-emergence spray, then all weeds needing an
+    Early Post spray, then all needing Late Post — rather than grouped
+    by weed first. This ordering is what every downstream table/
+    breakdown inherits, since they all iterate this same list.
+
     Returns a list of (target_id, spray_timing_or_None) tuples."""
     stage_col = cfg.get("stage_col")
     if not stage_col:
@@ -260,20 +326,46 @@ def _portfolio_treatment_windows(sheets: dict, cfg: dict, crop_id, target_ids: l
     if window_df.empty or stage_col not in window_df.columns:
         return [(tid, None) for tid in target_ids]
 
-    windows = []
+    if stage_filter:
+        # A specific timing was chosen — one entry per weed that
+        # actually has a window at that timing, no grouping decision
+        # needed since every entry shares the same single timing.
+        windows = []
+        for tid in target_ids:
+            w = window_df[
+                (window_df["crop_id"] == crop_id)
+                & (window_df[cfg["target_id_col"]] == tid)
+                & (window_df[stage_col].astype(str).str.strip() == stage_filter)
+            ]
+            if not w.empty:
+                windows.append((tid, stage_filter))
+        return windows
+
+    # 'All' — first work out which timing(s) each weed actually needs,
+    # then re-group the whole list by TIMING (canonical order) with
+    # every weed nested underneath, rather than by weed.
+    per_target_timings = {}  # target_id -> set of timing labels
     for tid in target_ids:
         w = window_df[(window_df["crop_id"] == crop_id) & (window_df[cfg["target_id_col"]] == tid)]
-        if stage_filter:
-            timings = [stage_filter] if not w[w[stage_col].astype(str).str.strip() == stage_filter].empty else []
-        else:
-            timings = sorted({str(v).strip() for v in w[stage_col].dropna() if str(v).strip()})
-        if not timings:
-            # No timing info at all for this weed (e.g. weed_stage left
-            # blank in the sheet) — still include it as one generic,
-            # timing-less entry rather than silently dropping it.
+        timings = {str(v).strip() for v in w[stage_col].dropna() if str(v).strip()}
+        per_target_timings[tid] = timings
+
+    all_timings_present = sorted(
+        {t for timings in per_target_timings.values() for t in timings},
+        key=_spray_timing_sort_key,
+    )
+
+    windows = []
+    for timing in all_timings_present:
+        for tid in target_ids:  # preserves the user's selection order within each timing group
+            if timing in per_target_timings.get(tid, set()):
+                windows.append((tid, timing))
+    # Any weed with NO timing info at all (blank weed_stage) still gets
+    # a single generic, timing-less entry, appended after every
+    # recognized timing group rather than silently dropped.
+    for tid in target_ids:
+        if not per_target_timings.get(tid):
             windows.append((tid, None))
-        else:
-            windows.extend((tid, t) for t in timings)
     return windows
 
 
