@@ -228,7 +228,13 @@ def render_price_comparison_view():
     # Moderate against another still counts as Effective here), not its
     # worst. Unrated is handled separately from the threshold itself,
     # since "not yet assessed" isn't the same claim as "confirmed weak".
-    col6, col7 = st.columns([2, 1])
+    #
+    # Minimum Tier filter sits alongside it — simpler than efficiency
+    # since tier is a fixed product-level attribute (from the master
+    # sheet) that doesn't vary by window/target, so there's no "mix" or
+    # "best of" to resolve, and no Unrated concept (normalize_tier
+    # always resolves to a real tier, defaulting unknowns to Generic).
+    col6, col7, col8 = st.columns([2, 1, 2])
     with col6:
         min_eff_choice = st.selectbox(
             "Minimum Efficiency", ["All", "Moderate or better", "Effective only"],
@@ -237,6 +243,11 @@ def render_price_comparison_view():
         )
     with col7:
         include_unrated = st.checkbox("Include Unrated", value=True, key="price_include_unrated")
+    with col8:
+        min_tier_choice = st.selectbox(
+            "Minimum Tier", ["All", "Medium or better", "Premium only"],
+            key="price_min_tier",
+        )
 
     eff_thresholds = {
         "Moderate or better": {"Effective", "Moderate"},
@@ -250,8 +261,15 @@ def render_price_comparison_view():
     elif not include_unrated:
         table = table[table["best_efficiency"] != "Unrated"]
 
+    tier_thresholds = {
+        "Medium or better": {"Premium", "Medium"},
+        "Premium only": {"Premium"},
+    }
+    if min_tier_choice in tier_thresholds:
+        table = table[table["tier"].isin(tier_thresholds[min_tier_choice])]
+
     if table.empty:
-        st.info(f"No products meet this efficiency filter for {target_choice}.")
+        st.info(f"No products meet these filters for {target_choice}.")
         st.stop()
 
     display = table.drop(columns=["best_efficiency"]).copy()
