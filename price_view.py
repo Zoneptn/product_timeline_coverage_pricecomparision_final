@@ -148,24 +148,54 @@ def _price_comparison_table(sheets: dict, cfg: dict, crop_id, target_id,
     return out.reset_index(drop=True)
 
 
-def render_price_comparison_view():
-    st.title("💰 Price Comparison")
-    st.caption("Compare every company's product for a specific weed, pest, or disease.")
+def _search_products_by_name(sheets: dict, search_term: str) -> pd.DataFrame:
+    """Searches the common_name column directly on ALL THREE master
+    sheets (prod_her/prod_ins/prod_fun) at once — a case-insensitive
+    substring match, e.g. 'copper' finds every copper-based product
+    regardless of which crop or pest it's linked to. No crop/target
+    scoping needed here at all: unlike the By Target flow, company/
+    trade_name/tier/price are all master-sheet-level attributes with no
+    crop dimension, so this is a much simpler, flatter lookup. Returns
+    one row per matching product, tagged with which category
+    (Herbicide/Insecticide/Fungicide) it came from."""
+    empty_cols = ["category", "company", "trade_name", "common_name", "tier",
+                  "price", "size", "usage", "cost", "cost_unit_label"]
+    if not search_term or not search_term.strip():
+        return pd.DataFrame(columns=empty_cols)
 
-    data_file = get_file_cov()
-    if data_file is None:
-        st.warning(
-            f"No workbook found. Upload one from the sidebar, or place a file "
-            f"named `{DEFAULT_PATH_COV}` next to `app.py`."
-        )
-        st.stop()
+    term = search_term.strip().lower()
+    rows = []
+    for category_choice, cfg in PRICE_CATEGORY_CONFIG.items():
+        master = sheets.get(cfg["master"], pd.DataFrame())
+        if master.empty or "common_name" not in master.columns:
+            continue
+        matches = master[master["common_name"].astype(str).str.lower().str.contains(term, na=False, regex=False)]
+        category_label = category_choice.split(" ")[0]  # "Herbicide (Weed)" -> "Herbicide"
+        for _, r in matches.iterrows():
+            rows.append({
+                "category": category_label,
+                "company": r.get("company", ""),
+                "trade_name": r.get("trade_name", ""),
+                "common_name": r.get("common_name", ""),
+                "tier": normalize_tier(r.get("tier")),
+                "price": r.get("price"),
+                "size": r.get("size"),
+                "usage": r.get("usage"),
+                "cost": r.get(cfg["cost_col"]),
+                "cost_unit_label": cfg["cost_unit_label"],
+            })
+    if not rows:
+        return pd.DataFrame(columns=empty_cols)
+    # Sort by common_name first so identical/similar active ingredients
+    # cluster together (the main point of this search — comparing the
+    # same chemical across companies) — then by category, since cost
+    # units differ across categories and shouldn't be interleaved as if
+    # comparable.
+    out = pd.DataFrame(rows, columns=empty_cols)
+    return out.sort_values(["common_name", "category"]).reset_index(drop=True)
 
-    try:
-        sheets = load_workbook_cov(data_file)
-    except Exception as e:
-        st.error(f"Couldn't read the workbook: {e}")
-        st.stop()
 
+def _render_by_target(sheets: dict):
     stage_df_all = sheets["crop_stage"]
     if stage_df_all.empty:
         st.error("`crop_stage` sheet is missing or empty.")
@@ -284,3 +314,90 @@ def render_price_comparison_view():
     })
     st.subheader(f"{target_choice} — {len(display)} product(s) across {display['Company'].nunique()} company(ies)")
     st.dataframe(display, use_container_width=True, hide_index=True)
+
+
+def _render_by_chemical_name(sheets: dict):
+    st.caption(
+        "Search across ALL crops and categories at once — e.g. type "
+        "'copper' to see every copper-based product any company sells, "
+        "regardless of which crop or pest it's linked to."
+    )
+    search_term = st.text_input(
+        "Search by chemical / common name", key="price_chem_search",
+        placeholder="e.g. copper, glyphosate, mancozeb",
+    )
+
+    min_tier_choice = st.selectbox(
+        "Minimum Tier", ["All", "Medium or better", "Premium only"],
+        key="price_chem_min_tier",
+    )
+
+    if not search_term.strip():
+        st.info("Type a chemical or active-ingredient name above to search.")
+        return
+
+    results = _search_products_by_name(sheets, search_term)
+    if results.empty:
+        st.info(f"No products found matching '{search_term}'.")
+        return
+
+    tier_thresholds = {
+        "Medium or better": {"Premium", "Medium"},
+        "Premium only": {"Premium"},
+    }
+    if min_tier_choice in tier_thresholds:
+        results = results[results["tier"].isin(tier_thresholds[min_tier_choice])]
+    if results.empty:
+        st.info(f"No products matching '{search_term}' meet this tier filter.")
+        return
+
+    display = results.copy()
+    display["price"] = display["price"].apply(_format_price)
+    display["cost"] = display.apply(
+        lambda r: _format_price(r["cost"]) + f"/{r['cost_unit_label']}" if _format_price(r["cost"]) else "—",
+        axis=1,
+    )
+    display = display.drop(columns=["cost_unit_label"]).rename(columns={
+        "category": "Category", "company": "Company", "trade_name": "Trade Name",
+        "common_name": "Common Name", "tier": "Tier", "price": "Price",
+        "size": "Size", "usage": "Usage", "cost": "Cost",
+    })
+    st.caption(
+        "Note: the Cost column's unit differs by category — per rai "
+        "(Herbicide) vs per 20L tank (Insecticide/Fungicide) — never "
+        "compare Cost values across different Category rows directly."
+    )
+    st.subheader(f"'{search_term}' — {len(display)} product(s) across "
+                 f"{display['Company'].nunique()} company(ies)")
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+
+def render_price_comparison_view():
+    st.title("💰 Price Comparison")
+    st.caption("Compare every company's product for a specific weed, pest, or disease.")
+
+    data_file = get_file_cov()
+    if data_file is None:
+        st.warning(
+            f"No workbook found. Upload one from the sidebar, or place a file "
+            f"named `{DEFAULT_PATH_COV}` next to `app.py`."
+        )
+        st.stop()
+
+    try:
+        sheets = load_workbook_cov(data_file)
+    except Exception as e:
+        st.error(f"Couldn't read the workbook: {e}")
+        st.stop()
+
+    mode = st.radio(
+        "Compare mode", ["By Target", "By Chemical Name"], horizontal=True, key="price_mode",
+        help="By Target: pick a crop + pest, compare companies. "
+             "By Chemical Name: search a chemical (e.g. copper) across everything at once.",
+    )
+    st.divider()
+
+    if mode == "By Target":
+        _render_by_target(sheets)
+    else:
+        _render_by_chemical_name(sheets)
