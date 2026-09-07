@@ -16,9 +16,9 @@ Crop Threat & Input view — reads crop_timeline.xlsx.
                   frac_code, efficiency (optional)
   fertilizer    : crop_id, crop, formula, start_day, end_day
 
-efficiency (Excellent/Effective/Moderate/Poor/Ineffective — same scale
-as the Coverage workbook) rates the ACTIVE INGREDIENT (common_name)
-itself against that specific pest/weed/disease — this sheet has no
+efficiency (Effective/Moderate/Ineffective — same scale as the
+Coverage workbook) rates the ACTIVE INGREDIENT (common_name) itself
+against that specific pest/weed/disease — this sheet has no
 company/brand dimension, just chemical-to-target links, unlike the
 Coverage workbook's per-product junction sheets. Entirely optional:
 omit the column, or leave individual cells blank, and it shows as
@@ -56,7 +56,7 @@ def aggregate_chemicals(merged: pd.DataFrame, group_cols: list,
                          name_col: str, code_col: str, code_label: str,
                          efficiency_col: str = None):
     """efficiency_col, if provided and present, appends an efficiency
-    badge to each bullet — e.g. '• glyphosate (HRAC 9) — ✅ Excellent'.
+    badge to each bullet — e.g. '• glyphosate (HRAC 9) — 🟢 Effective'.
     Here efficiency rates the ACTIVE INGREDIENT (common_name) itself
     against this specific pest/weed/disease, not a branded product —
     this sheet has no company/brand dimension, just chemical-to-target

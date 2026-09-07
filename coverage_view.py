@@ -153,12 +153,11 @@ def compute_coverage(window_df: pd.DataFrame, product_df: pd.DataFrame,
     is "type", not a resistance class), so it defaults off.
 
     track_efficiency=True additionally computes, per window, the set of
-    distinct efficiency ratings (Excellent/Effective/Moderate/Poor/
-    Ineffective, from the junction sheet's "efficiency" column) among the
-    covering products — a window can be 'Has Product' but still poorly
-    covered if every covering product rates Poor or Ineffective. Not
-    meaningful for fertilizer (no efficiency concept there), so it defaults
-    off.
+    distinct efficiency ratings (Effective/Moderate/Ineffective, from
+    the junction sheet's "efficiency" column) among the covering
+    products — a window can be 'Has Product' but still poorly covered
+    if every covering product rates Ineffective. Not meaningful for
+    fertilizer (no efficiency concept there), so it defaults off.
 
     track_cost=True additionally computes, per window, a 'cost_summary'
     string collapsing the covering products' cost_col value(s) into a
@@ -716,7 +715,7 @@ ANALYSIS_STYLE_CONFIG = {
             "Fertilizer), give ONE sentence on whether coverage is strong "
             "or thin — judged from coverage_status AND efficiency_mix "
             "together, not coverage_status alone, so a category with high "
-            "'Has Product' counts but mostly Poor/Ineffective/Unrated "
+            "'Has Product' counts but mostly Ineffective/Unrated "
             "efficiency reads as thin, not strong — plus the single most "
             "important reason why. Skip minor detail, skip restating "
             "every window, skip a portfolio tier breakdown unless it's "
@@ -741,12 +740,12 @@ ANALYSIS_STYLE_CONFIG = {
             "briefly. Base this judgment on coverage_status AND "
             "efficiency_mix together, not coverage_status alone — a "
             "category with high 'Has Product' counts but mostly "
-            "Poor/Ineffective/Unrated efficiency is NOT strong, it's a "
+            "Ineffective/Unrated efficiency is NOT strong, it's a "
             "false sense of coverage, and should be described that way.\n"
             "- Whether it leans Generic, Medium, or Premium overall, and which "
             "category pulls that either way.\n"
             "- Windows that are technically covered but efficiency_mix shows "
-            "Poor, Ineffective, or only Unrated — call these out "
+            "Ineffective, or only Unrated — call these out "
             "explicitly as 'soft gaps', distinct from true no-product "
             "gaps, since a green light on the coverage board doesn't "
             "guarantee a strong product is in play. A Moderate rating is "
@@ -815,13 +814,13 @@ def get_ai_analysis(summary_text: str, style: str = "Detailed") -> str:
         "hrac_mix/irac_mix/frac_mix list the distinct resistance codes "
         "covering that window (a single code = rotation risk); "
         "efficiency_mix (Weed/Insect/Disease only, not Fertilizer) lists the "
-        "efficiency rating(s) — Excellent/Effective/Moderate/Poor/Ineffective, "
+        "efficiency rating(s) — Effective/Moderate/Ineffective, "
         "or 'Unrated' if not yet documented — of the product(s) covering "
         "that window SPECIFICALLY against that pest/weed/disease (the "
         "same product can rate differently against different targets — "
-        "e.g. Excellent against one pest, Moderate against another). A "
+        "e.g. Effective against one pest, Moderate against another). A "
         "window being 'Has Product' does NOT mean it's well-covered if "
-        "efficiency_mix is Poor, Ineffective, or only Unrated — call that "
+        "efficiency_mix is Ineffective or only Unrated — call that "
         "out as a soft spot, distinct from a true 'No Product' gap. "
         "Don't treat 'Unrated' as if it means Ineffective; it only means "
         "the rating hasn't been documented yet.\n"

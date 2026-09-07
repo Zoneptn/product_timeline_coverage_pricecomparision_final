@@ -131,48 +131,51 @@ EFFECTIVENESS_SCORE = {
 
 
 # =====================================================================
-# Efficiency (5-point scale) lives on the JUNCTION sheets (weed_her /
-# pest_ins / disease_fun in crop_timeline_coverage.xlsx, and the
-# equivalent sheets in crop_timeline.xlsx) — not the product master
-# sheets. A product's real-world efficiency varies by which pest/weed/
-# disease it's up against (e.g. Chemical A might be Excellent against
-# Pest A but only Moderate against Pest B), so it belongs at the
-# product-x-target pairing, the same place trade_name/common_name
-# already sits. Used by Coverage boards, Threat & Input hover, Price
-# Comparison, and the AI analysis — NOT by chemical_analysis_view.py,
-# which uses the separate binary EFFECTIVENESS_* system above instead.
+# Efficiency lives on the JUNCTION sheets (weed_her / pest_ins /
+# disease_fun in crop_timeline_coverage.xlsx, and the equivalent sheets
+# in crop_timeline.xlsx) — not the product master sheets. A product's
+# real-world efficiency varies by which pest/weed/disease it's up
+# against, so it belongs at the product-x-target pairing, the same
+# place trade_name/common_name already sits. Used by Coverage boards,
+# Threat & Input hover, Price Comparison, and the AI analysis — NOT by
+# chemical_analysis_view.py, which uses the separate EFFECTIVENESS_*
+# system above instead (same 3-tier scale, different column name —
+# "efficiency" here vs "effectiveness" on the matrix sheets).
 #
-# Expected values: Excellent / Effective / Moderate / Poor / Ineffective
-# (5-point scale). Unlike tier, a blank/unrecognized value normalizes to
-# "Unrated" (not "Poor" or "Ineffective") — this is new data you're
-# likely filling in gradually, and an unrated product shouldn't be
-# treated as if it's a known poor performer. Fertilizer has no
-# efficiency concept (it's a nutrition schedule, not a pest/weed/disease
-# control decision), so it's intentionally not part of this anywhere.
+# Expected values: Effective / Moderate / Ineffective — a 3-point
+# scale, same as the Chemical Analysis matrix. This replaced an earlier
+# 5-point Excellent/Effective/Moderate/Poor/Ineffective scale after the
+# team found finer distinctions hard to rate consistently and prone to
+# bias. Unlike tier, a blank/unrecognized value normalizes to "Unrated"
+# (not "Ineffective") — this is data you're likely filling in
+# gradually, and an unrated product shouldn't be treated as if it's a
+# known poor performer. Fertilizer has no efficiency concept (it's a
+# nutrition schedule, not a pest/weed/disease control decision), so
+# it's intentionally not part of this anywhere.
 # =====================================================================
 
-EFFICIENCY_ORDER = ["Excellent", "Effective", "Moderate", "Poor", "Ineffective"]
+EFFICIENCY_ORDER = ["Effective", "Moderate", "Ineffective"]
 EFFICIENCY_BADGE = {
-    "Excellent": "✅ Excellent",
     "Effective": "🟢 Effective",
-    "Moderate": "🟨 Moderate",
-    "Poor": "🟠 Poor",
+    "Moderate": "🟡 Moderate",
     "Ineffective": "🔴 Ineffective",
     "Unrated": "❔ Unrated",
 }
 EFFICIENCY_ALIASES = {
-    "excellent": "Excellent", "strong": "Excellent", "high": "Excellent", "very good": "Excellent",
-    "effective": "Effective", "good": "Effective",
+    "effective": "Effective", "excellent": "Effective", "yes": "Effective",
+    "good": "Effective", "strong": "Effective", "high": "Effective", "very good": "Effective",
     "moderate": "Moderate", "average": "Moderate", "medium": "Moderate", "fair": "Moderate",
-    "poor": "Poor", "weak": "Poor", "low": "Poor",
-    "ineffective": "Ineffective", "none": "Ineffective", "no effect": "Ineffective", "very poor": "Ineffective",
+    "ok": "Moderate", "okay": "Moderate", "so-so": "Moderate",
+    "ineffective": "Ineffective", "poor": "Ineffective", "no": "Ineffective",
+    "weak": "Ineffective", "low": "Ineffective", "none": "Ineffective", "no effect": "Ineffective",
+    "very poor": "Ineffective", "not effective": "Ineffective", "doesn't work": "Ineffective",
 }
 
 
 def normalize_efficiency(val):
-    """Returns 'Excellent'/'Effective'/'Moderate'/'Poor'/'Ineffective', or
-    None if blank/unrecognized (caller decides how to label that — see
-    'Unrated' usage below)."""
+    """Returns 'Effective'/'Moderate'/'Ineffective', or None if blank/
+    unrecognized (caller decides how to label that — see 'Unrated'
+    usage below)."""
     if pd.isna(val):
         return None
     raw = str(val).strip()
@@ -186,15 +189,13 @@ def normalize_efficiency(val):
 
 
 # Shown as a caption under the Weed/Insect/Disease charts so the rating
-# words have a concrete, consistent meaning rather than being left to
-# guesswork. Adjust the percentages here if your team's definition of
-# "control" changes — this is the only place they're defined.
+# words have a clear, consistent meaning rather than being left to
+# guesswork.
 EFFICIENCY_LEGEND = (
-    "✅ **Excellent** >90% control | "
-    "🟢 **Effective** 80–89% control | "
-    "🟨 **Moderate** 60–79% control | "
-    "🟠 **Poor** 40–59% control | "
-    "🔴 **Ineffective** <40% control"
+    "🟢 **Effective** — works well against this target | "
+    "🟡 **Moderate** — partially effective | "
+    "🔴 **Ineffective** — doesn't work | "
+    "❔ **Unrated** — not yet assessed"
 )
 
 
