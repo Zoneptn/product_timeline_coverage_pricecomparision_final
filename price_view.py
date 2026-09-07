@@ -91,10 +91,11 @@ def _price_comparison_table(sheets: dict, cfg: dict, crop_id, target_id,
     that target appears in (deduped down to one row per product — price/
     size/usage/tier are product-level attributes and don't vary by
     window, only efficiency might, so efficiency is shown as a mix if it
-    does). ascending=True sorts cheapest first, False sorts priciest
-    first; rows with no price data always sort to the bottom either way
-    so they never get mistaken for the cheapest (or most expensive)
-    option."""
+    does, alongside a 'best_efficiency' column used for filtering — see
+    render_price_comparison_view's Minimum Efficiency control). ascending=True
+    sorts cheapest first, False sorts priciest first; rows with no price
+    data always sort to the bottom either way so they never get mistaken
+    for the cheapest (or most expensive) option."""
     junction = sheets.get(cfg["junction"], pd.DataFrame())
     master = sheets.get(cfg["master"], pd.DataFrame())
     j_id, m_id = cfg["junction_id"], cfg["master_id"]
@@ -123,18 +124,25 @@ def _price_comparison_table(sheets: dict, cfg: dict, crop_id, target_id,
             "/".join(e for e in EFFICIENCY_ORDER if e in efficiencies_present)
             if efficiencies_present else "Unrated"
         )
+        # Best rating this product has anywhere (a product can be
+        # Effective against one window and Moderate against another —
+        # for filtering purposes we judge it by its best showing, not
+        # its worst). Used by the Minimum Efficiency filter below;
+        # dropped before the table is displayed.
+        best_efficiency = next((e for e in EFFICIENCY_ORDER if e in efficiencies_present), "Unrated")
         rows.append({
             "company": first.get("company", ""),
             "trade_name": first.get("trade_name", ""),
             "common_name": first.get("common_name", ""),
             "tier": normalize_tier(first.get("tier")),
             "efficiency": efficiency_display,
+            "best_efficiency": best_efficiency,
             "price": first.get("price"),
             "size": first.get("size"),
             "usage": first.get("usage"),
             cfg["cost_col"]: first.get(cfg["cost_col"]),
         })
-    out = pd.DataFrame(rows, columns=empty_cols)
+    out = pd.DataFrame(rows, columns=empty_cols + ["best_efficiency"])
     out["_sort_cost"] = pd.to_numeric(out[cfg["cost_col"]], errors="coerce")
     out = out.sort_values("_sort_cost", ascending=ascending, na_position="last").drop(columns=["_sort_cost"])
     return out.reset_index(drop=True)
@@ -213,7 +221,40 @@ def render_price_comparison_view():
         st.info(f"No products found across any company for {target_choice}.")
         st.stop()
 
-    display = table.copy()
+    # Minimum Efficiency filter — lets weak products be excluded from
+    # the price comparison entirely, rather than sitting in the table
+    # next to genuinely good options. Judges each product by its BEST
+    # rating anywhere (a product Effective against one window and
+    # Moderate against another still counts as Effective here), not its
+    # worst. Unrated is handled separately from the threshold itself,
+    # since "not yet assessed" isn't the same claim as "confirmed weak".
+    col6, col7 = st.columns([2, 1])
+    with col6:
+        min_eff_choice = st.selectbox(
+            "Minimum Efficiency", ["All", "Moderate or better", "Effective only"],
+            key="price_min_eff",
+            help="Filters out products whose best rating anywhere falls below this bar.",
+        )
+    with col7:
+        include_unrated = st.checkbox("Include Unrated", value=True, key="price_include_unrated")
+
+    eff_thresholds = {
+        "Moderate or better": {"Effective", "Moderate"},
+        "Effective only": {"Effective"},
+    }
+    if min_eff_choice in eff_thresholds:
+        mask = table["best_efficiency"].isin(eff_thresholds[min_eff_choice])
+        if include_unrated:
+            mask = mask | (table["best_efficiency"] == "Unrated")
+        table = table[mask]
+    elif not include_unrated:
+        table = table[table["best_efficiency"] != "Unrated"]
+
+    if table.empty:
+        st.info(f"No products meet this efficiency filter for {target_choice}.")
+        st.stop()
+
+    display = table.drop(columns=["best_efficiency"]).copy()
     display["price"] = display["price"].apply(_format_price)
     display[cfg["cost_col"]] = display[cfg["cost_col"]].apply(
         lambda v: _format_price(v) + f"/{cfg['cost_unit_label']}" if _format_price(v) else "—"
