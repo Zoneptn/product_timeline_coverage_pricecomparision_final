@@ -175,7 +175,7 @@ def _companies_for_category(sheets: dict, cfg: dict) -> list:
 
 
 def _portfolio_cost_table(sheets: dict, cfg: dict, crop_id, target_ids: list,
-                           target_names: dict, companies: list) -> pd.DataFrame:
+                           target_names: dict, companies: list):
     """For each selected company, sums the CHEAPEST available product's
     cost across all selected targets — a company's own total is only
     ever built from real per-target lookups already used elsewhere
@@ -193,7 +193,17 @@ def _portfolio_cost_table(sheets: dict, cfg: dict, crop_id, target_ids: list,
     counted ONCE in the total, not once per target — you'd only
     actually buy it once. Deduplication is by (company, trade_name),
     since that's the identity already available from
-    _price_comparison_table's output."""
+    _price_comparison_table's output.
+
+    Returns (summary_df, breakdown_df). breakdown_df is long-format,
+    one row per (company, target) — the per-target detail behind each
+    summary total, for a line-item drill-down. When a product repeats
+    across targets for the same company, only its FIRST occurrence
+    (in target order) carries a cost; later occurrences show cost=None
+    with a note explaining it's the same product already counted —
+    this way, naively summing breakdown_df's cost column for one
+    company matches that company's total_cost exactly, rather than
+    silently double-counting shared products."""
     # Reuses the existing per-target lookup (_price_comparison_table)
     # rather than re-deriving costs — one call per target, keeping each
     # company's cheapest PRODUCT (not just its cost) for that target, so
@@ -216,18 +226,36 @@ def _portfolio_cost_table(sheets: dict, cfg: dict, crop_id, target_ids: list,
 
     n_targets = len(target_ids)
     rows = []
+    breakdown_rows = []
     for company in companies:
         products_used = {}  # trade_name -> cost, dict naturally dedupes
         covered = 0
         missing = []
+        seen_products = set()
         for tid in target_ids:
+            tname = target_names.get(tid, str(tid))
             pick = per_target_company_pick.get(tid, {}).get(company)
             if pick is not None:
                 trade_name, cost = pick
                 products_used[trade_name] = cost
                 covered += 1
+                if trade_name in seen_products:
+                    breakdown_rows.append({
+                        "company": company, "target": tname, "product": trade_name,
+                        "cost": None, "note": "Same product as above — already counted once",
+                    })
+                else:
+                    seen_products.add(trade_name)
+                    breakdown_rows.append({
+                        "company": company, "target": tname, "product": trade_name,
+                        "cost": cost, "note": "",
+                    })
             else:
-                missing.append(target_names.get(tid, str(tid)))
+                missing.append(tname)
+                breakdown_rows.append({
+                    "company": company, "target": tname, "product": None,
+                    "cost": None, "note": "No product for this target — gap",
+                })
         total = sum(products_used.values()) if products_used else None
         rows.append({
             "company": company,
@@ -238,8 +266,9 @@ def _portfolio_cost_table(sheets: dict, cfg: dict, crop_id, target_ids: list,
             "missing_targets": "; ".join(missing) if missing else "",
         })
     out = pd.DataFrame(rows)
+    breakdown_df = pd.DataFrame(breakdown_rows)
     if out.empty:
-        return out
+        return out, breakdown_df
     # Fully-covered companies first (cheapest first among those), then
     # partial coverage (cheapest partial total first), matching the
     # instinct that "cheapest AND complete" beats "cheapest but missing
@@ -249,7 +278,7 @@ def _portfolio_cost_table(sheets: dict, cfg: dict, crop_id, target_ids: list,
     out = out.sort_values(
         ["_fully_covered", "total_cost"], ascending=[False, True], na_position="last"
     ).drop(columns=["_fully_covered"])
-    return out.reset_index(drop=True)
+    return out.reset_index(drop=True), breakdown_df
 
 
 # Soft, visible-but-not-garish highlight — distinct from the app's
@@ -581,7 +610,7 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
         st.info("Pick at least one company above to compare.")
         return
 
-    table = _portfolio_cost_table(sheets, cfg, crop_id, target_ids, target_names, companies_choice)
+    table, breakdown_df = _portfolio_cost_table(sheets, cfg, crop_id, target_ids, target_names, companies_choice)
     if table.empty:
         st.info("No data to show for this selection.")
         return
@@ -604,6 +633,31 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
     st.subheader(f"Portfolio cost across {len(target_ids)} {category_choice.split(' ')[0].lower()} target(s)")
     st.dataframe(_highlight_companies(display, "Company", highlight_companies),
                  use_container_width=True, hide_index=True)
+
+    # Per-company drill-down: which target maps to which product, and
+    # what it costs — expanders (not another dataframe column) since
+    # st.dataframe can't show a nested/expandable detail per row.
+    # Ordered the same as the summary table above, so "cheapest first"
+    # still applies to which expander you'd naturally open first.
+    st.caption("Expand a company below to see exactly which product covers which target.")
+    for _, row in table.iterrows():
+        company = row["company"]
+        with st.expander(f"📋 {company} — {row['covered']}/{row['total_targets']} covered"):
+            company_detail = breakdown_df[breakdown_df["company"] == company].copy()
+            company_detail["cost"] = company_detail["cost"].apply(
+                lambda v: (_format_price(v) + f"/{cfg['cost_unit_label']}") if v is not None and not pd.isna(v) else "—"
+            )
+            company_detail["product"] = company_detail["product"].fillna("— (no product)")
+            company_detail = company_detail.rename(columns={
+                "target": "Target", "product": "Product", "cost": "Cost", "note": "Note",
+            })[["Target", "Product", "Cost", "Note"]]
+            st.dataframe(company_detail, use_container_width=True, hide_index=True)
+            total_display = (
+                _format_price(row["total_cost"]) + f"/{cfg['cost_unit_label']} (total)"
+                if row["total_cost"] is not None and not pd.isna(row["total_cost"]) else "—"
+            )
+            st.caption(f"**Total: {total_display}** — adds up the Cost column above, "
+                       "skipping rows already counted via a shared product.")
 
 
 def render_price_comparison_view():
