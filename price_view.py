@@ -234,23 +234,63 @@ def _companies_for_category(sheets: dict, cfg: dict) -> list:
     return sorted({str(c).strip() for c in master["company"].dropna() if str(c).strip()})
 
 
-def _portfolio_target_options(sheets: dict, cfg: dict, crop_id, target_ids: list,
-                               stage_filter: str = None) -> dict:
-    """Every available product option per (company, target) pair, sorted
-    cheapest first — the raw material behind both the auto-cheapest
-    default and the optional manual override (see 'Customize product
-    picks' in _render_portfolio_cost). Reuses _price_comparison_table
-    per target, same as before, just keeping every row instead of
-    collapsing straight to the cheapest one.
+def _portfolio_treatment_windows(sheets: dict, cfg: dict, crop_id, target_ids: list,
+                                  stage_filter: str = None) -> list:
+    """Expands the selected targets into the actual list of REQUIRED
+    treatment occasions to price out and sum.
 
-    stage_filter (Herbicide only) scopes each target's lookup to the
-    matching ws_id window(s) — same fix as in _render_by_target, so
-    'All' vs a specific timing actually produce different results here
-    too, instead of both silently pulling every timing regardless."""
-    options = {}  # (company, target_id) -> [(trade_name, cost), ...] sorted by cost asc
+    For categories with no timing concept (Insect/Disease), this is
+    just one entry per target — unchanged from before.
+
+    For Herbicide: if a SPECIFIC timing is selected, still one entry
+    per target (scoped to that timing). If 'All' is selected, a weed
+    needing treatment at BOTH Early Post and Late Post contributes TWO
+    entries here — one per timing — since those are separate, mandatory
+    spray occasions in the season, not alternative ways to cover the
+    same need. 'All' must therefore SUM the cost of every timing a weed
+    requires, not just pick whichever single timing happens to be
+    cheapest — picking only the cheapest would silently skip a spray
+    application the crop actually needs.
+
+    Returns a list of (target_id, spray_timing_or_None) tuples."""
+    stage_col = cfg.get("stage_col")
+    if not stage_col:
+        return [(tid, None) for tid in target_ids]
+    window_df = sheets.get(cfg["window_sheet"], pd.DataFrame())
+    if window_df.empty or stage_col not in window_df.columns:
+        return [(tid, None) for tid in target_ids]
+
+    windows = []
     for tid in target_ids:
-        ws_ids = _target_ws_ids(sheets, cfg, crop_id, tid, stage_filter)
-        t = _price_comparison_table(sheets, cfg, crop_id, tid, ascending=True, ws_ids=ws_ids)
+        w = window_df[(window_df["crop_id"] == crop_id) & (window_df[cfg["target_id_col"]] == tid)]
+        if stage_filter:
+            timings = [stage_filter] if not w[w[stage_col].astype(str).str.strip() == stage_filter].empty else []
+        else:
+            timings = sorted({str(v).strip() for v in w[stage_col].dropna() if str(v).strip()})
+        if not timings:
+            # No timing info at all for this weed (e.g. weed_stage left
+            # blank in the sheet) — still include it as one generic,
+            # timing-less entry rather than silently dropping it.
+            windows.append((tid, None))
+        else:
+            windows.extend((tid, t) for t in timings)
+    return windows
+
+
+def _portfolio_target_options(sheets: dict, cfg: dict, crop_id, treatment_windows: list) -> dict:
+    """Every available product option per (company, target, timing)
+    triple, sorted cheapest first — the raw material behind both the
+    auto-cheapest default and the optional manual override (see
+    'Customize product picks' in _render_portfolio_cost). Each entry in
+    treatment_windows (from _portfolio_treatment_windows) gets its OWN
+    scoped price lookup via _target_ws_ids, so a weed requiring two
+    timings correctly gets two independent option lists — one per
+    timing — rather than one pooled list that would let the cheaper
+    timing's product silently substitute for the other."""
+    options = {}  # (company, target_id, timing) -> [(trade_name, cost), ...] sorted by cost asc
+    for target_id, timing in treatment_windows:
+        ws_ids = _target_ws_ids(sheets, cfg, crop_id, target_id, timing)
+        t = _price_comparison_table(sheets, cfg, crop_id, target_id, ascending=True, ws_ids=ws_ids)
         if t.empty:
             continue
         t = t.copy()
@@ -258,81 +298,86 @@ def _portfolio_target_options(sheets: dict, cfg: dict, crop_id, target_ids: list
         t_valid = t.dropna(subset=["_cost_num"])
         for company, g in t_valid.groupby("company"):
             pairs = sorted(zip(g["trade_name"], g["_cost_num"]), key=lambda p: p[1])
-            options[(company, tid)] = pairs
+            options[(company, target_id, timing)] = pairs
     return options
 
 
 def _default_picks(all_options: dict) -> dict:
-    """Cheapest option per (company, target) combo — used as-is when
-    'Customize product picks' is off, and as the starting point for any
-    combo the user hasn't manually overridden when it's on."""
+    """Cheapest option per (company, target, timing) combo — used as-is
+    when 'Customize product picks' is off, and as the starting point
+    for any combo the user hasn't manually overridden when it's on."""
     return {key: opts[0] for key, opts in all_options.items() if opts}
 
 
-def _resolve_portfolio(target_ids: list, target_names: dict, companies: list, picks: dict):
-    """picks: {(company, target_id): (trade_name, cost)} — the resolved
-    product for every combo that has one (auto-cheapest or a manual
-    override); a combo simply absent from picks is treated as a gap
-    (no product for that target). Shared by both the default and
-    'Customize product picks' paths so the totals/breakdown logic can
-    never diverge between the two — same summing and same dedup rule
-    either way.
+def _resolve_portfolio(treatment_windows: list, target_names: dict, companies: list, picks: dict):
+    """treatment_windows: list of (target_id, spray_timing_or_None) —
+    the REQUIRED line items to price out and sum (see
+    _portfolio_treatment_windows; under 'All' timing, one weed can
+    contribute more than one entry here, one per timing it needs).
+    picks: {(company, target_id, timing): (trade_name, cost)} — the
+    resolved product for every combo that has one (auto-cheapest or a
+    manual override); a combo absent from picks is a gap. Shared by
+    both the default and 'Customize product picks' paths so the
+    totals/breakdown logic can never diverge between the two.
 
-    IMPORTANT — one product commonly covers MULTIPLE targets (a
-    broad-spectrum product handling several pests). If the resolved
-    pick for more than one selected target turns out to be the SAME
-    product for a given company, its cost is counted ONCE in the
-    total, not once per target — you'd only actually buy it once.
-    Deduplication is by (company, trade_name).
+    IMPORTANT — dedup rule: the SAME product picked for two DIFFERENT
+    targets AT THE SAME TIMING is counted ONCE (one broad-spectrum
+    product, one spray pass, covering multiple pests/weeds together).
+    But the SAME product picked at DIFFERENT TIMINGS is counted
+    SEPARATELY, even for the same target — Early Post and Late Post
+    are different spray occasions in the season, so using the same
+    product at both means buying/applying it twice. Dedup key is
+    therefore (trade_name, timing), not trade_name alone.
 
     Returns (summary_df, breakdown_df). breakdown_df is long-format,
-    one row per (company, target) — the per-target detail behind each
-    summary total. When a product repeats across targets for the same
-    company, only its FIRST occurrence (in target order) carries a
-    cost; later occurrences show cost=None with a note explaining it's
-    the same product already counted — this way, naively summing
-    breakdown_df's cost column for one company matches that company's
-    total_cost exactly, rather than silently double-counting shared
-    products."""
-    n_targets = len(target_ids)
+    one row per (target, timing) per company. When a product repeats
+    across DIFFERENT TARGETS at the SAME timing, only its first
+    occurrence (in window order) carries a cost; later ones show
+    cost=None with a note — so naively summing breakdown_df's cost
+    column for one company matches that company's total_cost exactly."""
+    n_windows = len(treatment_windows)
     rows = []
     breakdown_rows = []
     for company in companies:
-        products_used = {}  # trade_name -> cost, dict naturally dedupes
+        total = 0.0
         covered = 0
         missing = []
-        seen_products = set()
-        for tid in target_ids:
-            tname = target_names.get(tid, str(tid))
-            pick = picks.get((company, tid))
+        products_used = set()
+        seen = set()  # (trade_name, timing) dedup key
+        for target_id, timing in treatment_windows:
+            tname = target_names.get(target_id, str(target_id))
+            label = f"{tname} ({timing})" if timing else tname
+            pick = picks.get((company, target_id, timing))
             if pick is not None:
                 trade_name, cost = pick
-                products_used[trade_name] = cost
                 covered += 1
-                if trade_name in seen_products:
+                dedup_key = (trade_name, timing)
+                if dedup_key in seen:
                     breakdown_rows.append({
-                        "company": company, "target": tname, "product": trade_name,
-                        "cost": None, "note": "Same product as above — already counted once",
+                        "company": company, "target": tname, "spray_timing": timing,
+                        "product": trade_name, "cost": None,
+                        "note": "Same product already counted for this timing",
                     })
                 else:
-                    seen_products.add(trade_name)
+                    seen.add(dedup_key)
+                    total += cost
+                    products_used.add(trade_name)
                     breakdown_rows.append({
-                        "company": company, "target": tname, "product": trade_name,
-                        "cost": cost, "note": "",
+                        "company": company, "target": tname, "spray_timing": timing,
+                        "product": trade_name, "cost": cost, "note": "",
                     })
             else:
-                missing.append(tname)
+                missing.append(label)
                 breakdown_rows.append({
-                    "company": company, "target": tname, "product": None,
-                    "cost": None, "note": "No product for this target — gap",
+                    "company": company, "target": tname, "spray_timing": timing,
+                    "product": None, "cost": None, "note": "No product for this window — gap",
                 })
-        total = sum(products_used.values()) if products_used else None
         rows.append({
             "company": company,
             "covered": covered,
-            "total_targets": n_targets,
-            "total_cost": total,
-            "products_used": "; ".join(sorted(products_used.keys())),
+            "total_targets": n_windows,
+            "total_cost": total if covered > 0 else None,
+            "products_used": "; ".join(sorted(products_used)),
             "missing_targets": "; ".join(missing) if missing else "",
         })
     out = pd.DataFrame(rows)
@@ -618,13 +663,19 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
     st.caption(
         "Pick several targets in ONE category — see each company's total "
         "cost to cover all of them (using their cheapest product per "
-        "target by default — see 'Customize product picks' below to "
-        "choose a different one), plus a flag for anyone missing "
-        "coverage on one or more. If one product covers multiple "
-        "selected targets, its cost is only counted once, not once per "
-        "target. Note: this can't yet mix categories into one number, "
-        "since ฿/rai (Herbicide) and ฿/20L tank (Insecticide/Fungicide) "
-        "aren't the same unit — pick one category per comparison for now."
+        "target/timing by default — see 'Customize product picks' below "
+        "to choose a different one), plus a flag for anyone missing "
+        "coverage on one or more. For Herbicide with 'All' timing "
+        "selected, a weed needing BOTH Early Post and Late Post treatment "
+        "adds BOTH as separate required costs (they're different spray "
+        "occasions, not alternatives) — picking a single specific timing "
+        "instead scopes the total to just that one spray. If the same "
+        "product is used to cover multiple DIFFERENT targets at the SAME "
+        "timing, its cost is only counted once (one spray pass); the "
+        "same product used at DIFFERENT timings is counted separately. "
+        "Note: this can't yet mix categories into one number, since "
+        "฿/rai (Herbicide) and ฿/20L tank (Insecticide/Fungicide) aren't "
+        "the same unit — pick one category per comparison for now."
     )
 
     stage_df_all = sheets["crop_stage"]
@@ -676,6 +727,15 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
     target_ids = [target_name_to_id[t] for t in target_choices]
     target_names = {tid: name for name, tid in target_name_to_id.items() if tid in target_ids}
 
+    # Expands the chosen weeds into the actual required treatment
+    # occasions — see _portfolio_treatment_windows. With a SPECIFIC
+    # timing selected, this is one entry per weed (unchanged). With
+    # 'All' selected (Herbicide only), a weed needing both Early Post
+    # AND Late Post now correctly contributes TWO entries here, so the
+    # total below sums every required spray rather than picking
+    # whichever single timing happens to be cheapest.
+    treatment_windows = _portfolio_treatment_windows(sheets, cfg, crop_id, target_ids, stage_filter)
+
     category_companies = _companies_for_category(sheets, cfg)
     if not category_companies:
         st.info(f"No companies found for {category_choice.lower()} on this crop.")
@@ -689,49 +749,53 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
         st.info("Pick at least one company above to compare.")
         return
 
-    all_options = _portfolio_target_options(sheets, cfg, crop_id, target_ids, stage_filter=stage_filter)
+    all_options = _portfolio_target_options(sheets, cfg, crop_id, treatment_windows)
     picks = _default_picks(all_options)
 
     # Customize product picks — off by default (auto-cheapest, exactly
-    # as before). When on, only (company, target) combos that actually
-    # HAVE more than one product option get a dropdown — no point
-    # showing a picker where there's nothing to choose between. Picks
-    # made here are collected into `picks` and immediately feed the
-    # summary/breakdown below, since Streamlit reruns top-to-bottom on
-    # every widget interaction and a selectbox's return value already
-    # reflects the latest choice at the point it's read.
+    # as before). When on, only (company, target, timing) combos that
+    # actually HAVE more than one product option get a dropdown — no
+    # point showing a picker where there's nothing to choose between.
+    # Picks made here are collected into `picks` and immediately feed
+    # the summary/breakdown below, since Streamlit reruns top-to-bottom
+    # on every widget interaction and a selectbox's return value
+    # already reflects the latest choice at the point it's read.
     customize = st.checkbox(
         "Customize product picks", key="pf_customize",
-        help="Off: automatically uses each company's cheapest product per target. "
-             "On: shows a dropdown (defaulting to cheapest) for any company/target "
+        help="Off: automatically uses each company's cheapest product per target/timing. "
+             "On: shows a dropdown (defaulting to cheapest) for any company/target/timing "
              "that has more than one product option, so you can pick a different one.",
     )
     if customize:
         any_adjustable = False
         for company in companies_choice:
-            adjustable_targets = [tid for tid in target_ids if len(all_options.get((company, tid), [])) > 1]
-            if not adjustable_targets:
+            adjustable_windows = [
+                (tid, timing) for tid, timing in treatment_windows
+                if len(all_options.get((company, tid, timing), [])) > 1
+            ]
+            if not adjustable_windows:
                 continue
             any_adjustable = True
             with st.expander(f"🔧 Adjust picks — {company}"):
-                for tid in adjustable_targets:
+                for tid, timing in adjustable_windows:
                     tname = target_names[tid]
-                    opts = all_options[(company, tid)]
+                    row_label = f"{tname} — {timing}" if timing else tname
+                    opts = all_options[(company, tid, timing)]
                     labels = [f"{tn} — {_format_price(c)}/{cfg['cost_unit_label']}" for tn, c in opts]
-                    pick_key = f"pf_pick_{company}_{tid}"
-                    chosen_label = st.selectbox(tname, labels, key=pick_key)
-                    picks[(company, tid)] = opts[labels.index(chosen_label)]
+                    pick_key = f"pf_pick_{company}_{tid}_{timing}"
+                    chosen_label = st.selectbox(row_label, labels, key=pick_key)
+                    picks[(company, tid, timing)] = opts[labels.index(chosen_label)]
         if not any_adjustable:
-            st.caption("No company/target in this selection has more than one product option to choose between.")
+            st.caption("No company/target/timing in this selection has more than one product option to choose between.")
 
-    table, breakdown_df = _resolve_portfolio(target_ids, target_names, companies_choice, picks)
+    table, breakdown_df = _resolve_portfolio(treatment_windows, target_names, companies_choice, picks)
     if table.empty:
         st.info("No data to show for this selection.")
         return
 
     display = table.copy()
     display["Coverage"] = display.apply(
-        lambda r: f"{r['covered']}/{r['total_targets']}"
+        lambda r: f"{r['covered']}/{r['total_targets']} windows"
         + (" ⚠️" if r["covered"] < r["total_targets"] else " ✅"),
         axis=1,
     )
@@ -744,7 +808,8 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
     })
     display = display[["Company", "Coverage", "Total Cost", "Products Used", "Missing Targets"]]
 
-    st.subheader(f"Portfolio cost across {len(target_ids)} {category_choice.split(' ')[0].lower()} target(s)")
+    st.subheader(f"Portfolio cost across {len(treatment_windows)} required "
+                 f"{category_choice.split(' ')[0].lower()} treatment window(s)")
     st.dataframe(_highlight_companies(display, "Company", highlight_companies),
                  use_container_width=True, hide_index=True)
 
@@ -752,19 +817,28 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
     # what it costs — expanders (not another dataframe column) since
     # st.dataframe can't show a nested/expandable detail per row.
     # Ordered the same as the summary table above, so "cheapest first"
-    # still applies to which expander you'd naturally open first.
-    st.caption("Expand a company below to see exactly which product covers which target.")
+    # still applies to which expander you'd naturally open first. Spray
+    # Timing column only added for Herbicide (cfg has 'stage_col') —
+    # Insect/Disease have no timing concept, so it'd just be a blank
+    # column there.
+    has_stage = bool(cfg.get("stage_col"))
+    st.caption("Expand a company below to see exactly which product covers which target/timing.")
     for _, row in table.iterrows():
         company = row["company"]
-        with st.expander(f"📋 {company} — {row['covered']}/{row['total_targets']} covered"):
+        with st.expander(f"📋 {company} — {row['covered']}/{row['total_targets']} windows covered"):
             company_detail = breakdown_df[breakdown_df["company"] == company].copy()
             company_detail["cost"] = company_detail["cost"].apply(
                 lambda v: (_format_price(v) + f"/{cfg['cost_unit_label']}") if v is not None and not pd.isna(v) else "—"
             )
             company_detail["product"] = company_detail["product"].fillna("— (no product)")
-            company_detail = company_detail.rename(columns={
-                "target": "Target", "product": "Product", "cost": "Cost", "note": "Note",
-            })[["Target", "Product", "Cost", "Note"]]
+            rename_map = {"target": "Target", "product": "Product", "cost": "Cost", "note": "Note"}
+            display_cols = ["Target", "Product", "Cost"]
+            if has_stage:
+                company_detail["spray_timing"] = company_detail["spray_timing"].fillna("—")
+                rename_map["spray_timing"] = "Spray Timing"
+                display_cols.append("Spray Timing")
+            display_cols.append("Note")
+            company_detail = company_detail.rename(columns=rename_map)[display_cols]
             st.dataframe(company_detail, use_container_width=True, hide_index=True)
             total_display = (
                 _format_price(row["total_cost"]) + f"/{cfg['cost_unit_label']} (total)"
