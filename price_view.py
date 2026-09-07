@@ -12,6 +12,7 @@ apply to it the same way.
 
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
 
 from shared import TIER_ORDER, normalize_tier, EFFICIENCY_ORDER, normalize_efficiency, _format_price
 from data_cov import DEFAULT_PATH_COV, load_workbook_cov, get_file_cov
@@ -940,6 +941,117 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
                        "skipping rows already counted via a shared product.")
 
 
+def _render_full_treatment_program(sheets: dict, highlight_companies: list):
+    st.caption(
+        "Compare a company's TOTAL cost across ALL THREE categories side "
+        "by side for one crop, using every target in each category by "
+        "default (for finer control over which specific targets count, "
+        "use Portfolio Cost mode instead — this view is the quick "
+        "full-picture version). Categories are shown as separate "
+        "charts/tables since ฿/rai (Herbicide) and ฿/20L tank "
+        "(Insecticide/Fungicide) aren't the same unit and can't be "
+        "summed into one number — never compare bar heights ACROSS the "
+        "three charts below, only within one chart."
+    )
+
+    stage_df_all = sheets["crop_stage"]
+    if stage_df_all.empty:
+        st.error("`crop_stage` sheet is missing or empty.")
+        st.stop()
+    crop_lookup = stage_df_all[["crop_id", "crop"]].drop_duplicates()
+    crop_name_to_id = dict(zip(crop_lookup["crop"], crop_lookup["crop_id"]))
+
+    crop_choice = st.selectbox("Crop", list(crop_name_to_id.keys()), key="ftp_crop")
+    crop_id = crop_name_to_id[crop_choice]
+
+    all_companies_here = _all_companies(sheets)
+    companies_choice = st.multiselect(
+        "Companies to compare", all_companies_here, key="ftp_companies",
+        default=highlight_companies or None,
+        help="Defaults to whatever you picked in 'Highlight companies' above, if applicable.",
+    )
+    if not companies_choice:
+        st.info("Pick at least one company above to compare.")
+        return
+
+    for category_choice, cfg in PRICE_CATEGORY_CONFIG.items():
+        st.subheader(category_choice.split(" ")[0])
+
+        targets = _price_target_options(sheets, cfg, crop_id)
+        if targets.empty:
+            st.info(f"No {category_choice.lower()} targets found for this crop.")
+            st.divider()
+            continue
+        target_ids = targets[cfg["target_id_col"]].tolist()
+        target_names = dict(zip(targets[cfg["target_id_col"]], targets["name_en"]))
+
+        category_companies = _companies_for_category(sheets, cfg)
+        relevant_companies = [c for c in companies_choice if c in category_companies]
+        if not relevant_companies:
+            st.info(f"None of the selected companies have {category_choice.lower()} products for this crop.")
+            st.divider()
+            continue
+
+        # Reuses the exact same Portfolio Cost machinery (all targets in
+        # this category, auto-cheapest per window, correct timing-aware
+        # summing for Herbicide) — this view is that same calculation
+        # run once per category and laid out side by side, not a
+        # separate calculation with its own rules to keep in sync.
+        treatment_windows = _portfolio_treatment_windows(sheets, cfg, crop_id, target_ids, stage_filter=None)
+        all_options = _portfolio_target_options(sheets, cfg, crop_id, treatment_windows)
+        picks = _default_picks(all_options)
+        summary, _ = _resolve_portfolio(treatment_windows, target_names, relevant_companies, picks)
+        if summary.empty:
+            st.info(f"No data to show for {category_choice.lower()}.")
+            st.divider()
+            continue
+
+        # Two series (Fully covered / Partial coverage) rather than one,
+        # so a company missing part of its coverage renders in a
+        # visibly different color — a low total that's hiding a gap
+        # shouldn't look as good at a glance as a genuinely complete one.
+        full_vals, partial_vals = [], []
+        for _, row in summary.iterrows():
+            cost = row["total_cost"] if row["total_cost"] is not None and not pd.isna(row["total_cost"]) else 0
+            if row["covered"] > 0 and row["covered"] == row["total_targets"]:
+                full_vals.append(cost)
+                partial_vals.append(0)
+            else:
+                full_vals.append(0)
+                partial_vals.append(cost)
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(name="Fully covered", x=summary["company"], y=full_vals,
+                              marker_color="#2A9D8F"))
+        fig.add_trace(go.Bar(name="Partial coverage", x=summary["company"], y=partial_vals,
+                              marker_color="#E76F51"))
+        fig.update_layout(
+            barmode="group",
+            height=320,
+            margin=dict(l=10, r=10, t=10, b=10),
+            yaxis=dict(title=f"Total cost ({cfg['cost_unit_label']})"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        display = summary.copy()
+        display["Coverage"] = display.apply(
+            lambda r: f"{r['covered']}/{r['total_targets']} windows"
+            + (" ⚠️" if r["covered"] < r["total_targets"] else " ✅"),
+            axis=1,
+        )
+        display["Total Cost"] = display["total_cost"].apply(
+            lambda v: (_format_price(v) + f"/{cfg['cost_unit_label']} (total)") if v is not None and not pd.isna(v) else "—"
+        )
+        display = display.rename(columns={
+            "company": "Company", "products_used": "Products Used", "missing_targets": "Missing Targets",
+        })
+        display = display[["Company", "Coverage", "Total Cost", "Products Used", "Missing Targets"]]
+        st.dataframe(_highlight_companies(display, "Company", highlight_companies),
+                     use_container_width=True, hide_index=True)
+        st.divider()
+
+
 def render_price_comparison_view():
     st.title("💰 Price Comparison")
     st.caption("Compare every company's product for a specific weed, pest, or disease.")
@@ -959,10 +1071,12 @@ def render_price_comparison_view():
         st.stop()
 
     mode = st.radio(
-        "Compare mode", ["By Target", "By Chemical Name", "Portfolio Cost"], horizontal=True, key="price_mode",
+        "Compare mode", ["By Target", "By Chemical Name", "Portfolio Cost", "Full Treatment Program"],
+        horizontal=True, key="price_mode",
         help="By Target: pick a crop + pest, compare companies. "
              "By Chemical Name: search a chemical (e.g. copper) across everything at once. "
-             "Portfolio Cost: total cost across several targets at once, per company.",
+             "Portfolio Cost: total cost across several targets at once, per company. "
+             "Full Treatment Program: all three categories side by side for a whole crop.",
     )
 
     # Shared across both modes via the same widget key, so picking your
@@ -983,5 +1097,7 @@ def render_price_comparison_view():
         _render_by_target(sheets, highlight_companies)
     elif mode == "By Chemical Name":
         _render_by_chemical_name(sheets, highlight_companies)
-    else:
+    elif mode == "Portfolio Cost":
         _render_portfolio_cost(sheets, highlight_companies)
+    else:
+        _render_full_treatment_program(sheets, highlight_companies)
