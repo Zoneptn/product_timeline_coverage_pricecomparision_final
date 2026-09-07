@@ -185,38 +185,56 @@ def _portfolio_cost_table(sheets: dict, cfg: dict, crop_id, target_ids: list,
     rather than being silently dropped or blocked from showing anything
     at all — a real gap is exactly the kind of thing this view exists
     to surface. NOT for combining categories: units differ (per rai vs
-    per 20L tank), so target_ids must all come from the SAME category."""
+    per 20L tank), so target_ids must all come from the SAME category.
+
+    IMPORTANT — one product commonly covers MULTIPLE targets (a
+    broad-spectrum product handling several pests). If it's picked as
+    the cheapest option for more than one selected target, its cost is
+    counted ONCE in the total, not once per target — you'd only
+    actually buy it once. Deduplication is by (company, trade_name),
+    since that's the identity already available from
+    _price_comparison_table's output."""
     # Reuses the existing per-target lookup (_price_comparison_table)
-    # rather than re-deriving costs — one call per target, grouped down
-    # to each company's cheapest product for that target.
-    per_target_company_cost = {}  # target_id -> {company: cheapest cost}
+    # rather than re-deriving costs — one call per target, keeping each
+    # company's cheapest PRODUCT (not just its cost) for that target, so
+    # the same product picked for multiple targets can be recognized and
+    # deduped below.
+    per_target_company_pick = {}  # target_id -> {company: (trade_name, cost)}
     for tid in target_ids:
         t = _price_comparison_table(sheets, cfg, crop_id, tid, ascending=True)
         if t.empty:
-            per_target_company_cost[tid] = {}
+            per_target_company_pick[tid] = {}
             continue
         t = t.copy()
         t["_cost_num"] = pd.to_numeric(t[cfg["cost_col"]], errors="coerce")
-        per_target_company_cost[tid] = t.dropna(subset=["_cost_num"]).groupby("company")["_cost_num"].min().to_dict()
+        t_valid = t.dropna(subset=["_cost_num"])
+        picks = {}
+        for company, g in t_valid.groupby("company"):
+            best_row = g.loc[g["_cost_num"].idxmin()]
+            picks[company] = (best_row["trade_name"], best_row["_cost_num"])
+        per_target_company_pick[tid] = picks
 
     n_targets = len(target_ids)
     rows = []
     for company in companies:
-        total = 0.0
+        products_used = {}  # trade_name -> cost, dict naturally dedupes
         covered = 0
         missing = []
         for tid in target_ids:
-            cost = per_target_company_cost.get(tid, {}).get(company)
-            if cost is not None:
-                total += cost
+            pick = per_target_company_pick.get(tid, {}).get(company)
+            if pick is not None:
+                trade_name, cost = pick
+                products_used[trade_name] = cost
                 covered += 1
             else:
                 missing.append(target_names.get(tid, str(tid)))
+        total = sum(products_used.values()) if products_used else None
         rows.append({
             "company": company,
             "covered": covered,
             "total_targets": n_targets,
-            "total_cost": total if covered > 0 else None,
+            "total_cost": total,
+            "products_used": "; ".join(sorted(products_used.keys())),
             "missing_targets": "; ".join(missing) if missing else "",
         })
     out = pd.DataFrame(rows)
@@ -494,9 +512,11 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
         "Pick several targets in ONE category — see each company's total "
         "cost to cover all of them (using their cheapest product per "
         "target), plus a flag for anyone missing coverage on one or more. "
-        "Note: this can't yet mix categories into one number, since ฿/rai "
-        "(Herbicide) and ฿/20L tank (Insecticide/Fungicide) aren't the "
-        "same unit — pick one category per comparison for now."
+        "If one product covers multiple selected targets, its cost is "
+        "only counted once, not once per target. Note: this can't yet mix "
+        "categories into one number, since ฿/rai (Herbicide) and ฿/20L "
+        "tank (Insecticide/Fungicide) aren't the same unit — pick one "
+        "category per comparison for now."
     )
 
     stage_df_all = sheets["crop_stage"]
@@ -517,9 +537,24 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
     cfg = PRICE_CATEGORY_CONFIG[category_choice]
     name_col = "name_en" if lang_choice == "English" else "name_th"
 
-    targets = _price_target_options(sheets, cfg, crop_id)
+    # Spray Timing (e.g. Pre-emergence / Early Post / Late Post) only
+    # exists for Herbicide, same as By Target mode — "All" pools every
+    # timing's targets together into one multiselect; picking a specific
+    # timing narrows the target list to just that timing's weeds.
+    stage_options = _price_stage_options(sheets, cfg, crop_id)
+    stage_filter = None
+    if stage_options:
+        stage_choice = st.selectbox(
+            "Spray Timing", ["All"] + stage_options, key="pf_stage"
+        )
+        stage_filter = None if stage_choice == "All" else stage_choice
+
+    targets = _price_target_options(sheets, cfg, crop_id, stage_filter=stage_filter)
     if targets.empty:
-        st.info(f"No {category_choice.lower()} targets found for this crop.")
+        if stage_filter:
+            st.info(f"No {category_choice.lower()} targets found for '{stage_filter}' timing on this crop.")
+        else:
+            st.info(f"No {category_choice.lower()} targets found for this crop.")
         st.stop()
 
     target_name_to_id = dict(zip(targets[name_col], targets[cfg["target_id_col"]]))
@@ -560,8 +595,11 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
     display["Total Cost"] = display["total_cost"].apply(
         lambda v: (_format_price(v) + f"/{cfg['cost_unit_label']} (total)") if v is not None and not pd.isna(v) else "—"
     )
-    display = display.rename(columns={"company": "Company", "missing_targets": "Missing Targets"})
-    display = display[["Company", "Coverage", "Total Cost", "Missing Targets"]]
+    display = display.rename(columns={
+        "company": "Company", "products_used": "Products Used",
+        "missing_targets": "Missing Targets",
+    })
+    display = display[["Company", "Coverage", "Total Cost", "Products Used", "Missing Targets"]]
 
     st.subheader(f"Portfolio cost across {len(target_ids)} {category_choice.split(' ')[0].lower()} target(s)")
     st.dataframe(_highlight_companies(display, "Company", highlight_companies),
