@@ -166,7 +166,11 @@ def _all_companies(sheets: dict) -> list:
 # Soft, visible-but-not-garish highlight — distinct from the app's
 # other colors (red/green coverage status, tier/efficiency badges) so
 # it doesn't get visually confused with any of those.
-_HIGHLIGHT_COLOR = "#FFF3B0"
+_HIGHLIGHT_BG = "#FFF3B0"
+# Force dark text on the highlighted background regardless of the
+# viewer's Streamlit theme — without this, a dark-mode user's default
+# white cell text becomes invisible against the light yellow highlight.
+_HIGHLIGHT_TEXT = "#1A1A1A"
 
 
 def _highlight_companies(display_df: pd.DataFrame, company_col: str, highlight_list: list):
@@ -182,7 +186,7 @@ def _highlight_companies(display_df: pd.DataFrame, company_col: str, highlight_l
 
     def _row_style(row):
         if row[company_col] in highlight_list:
-            return [f"background-color: {_HIGHLIGHT_COLOR}"] * len(row)
+            return [f"background-color: {_HIGHLIGHT_BG}; color: {_HIGHLIGHT_TEXT}"] * len(row)
         return [""] * len(row)
 
     return display_df.style.apply(_row_style, axis=1)
