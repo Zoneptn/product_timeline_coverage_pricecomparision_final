@@ -148,6 +148,46 @@ def _price_comparison_table(sheets: dict, cfg: dict, crop_id, target_id,
     return out.reset_index(drop=True)
 
 
+def _all_companies(sheets: dict) -> list:
+    """Union of every company appearing anywhere across the three
+    master sheets (prod_her/prod_ins/prod_fun), regardless of which
+    crop/target/mode is currently selected — used to populate the
+    top-level 'Highlight companies' picker so it stays stable and
+    available no matter what else on the page is being filtered."""
+    companies = set()
+    for cfg in PRICE_CATEGORY_CONFIG.values():
+        master = sheets.get(cfg["master"], pd.DataFrame())
+        if master.empty or "company" not in master.columns:
+            continue
+        companies.update(str(c).strip() for c in master["company"].dropna() if str(c).strip())
+    return sorted(companies)
+
+
+# Soft, visible-but-not-garish highlight — distinct from the app's
+# other colors (red/green coverage status, tier/efficiency badges) so
+# it doesn't get visually confused with any of those.
+_HIGHLIGHT_COLOR = "#FFF3B0"
+
+
+def _highlight_companies(display_df: pd.DataFrame, company_col: str, highlight_list: list):
+    """Returns a pandas Styler that shades entire rows for any company
+    in highlight_list, or the plain DataFrame unchanged if nothing's
+    selected — st.dataframe renders either one correctly, so callers
+    don't need an if/else at the call site. All selected companies
+    share one highlight color (a group of 'companies I care about'),
+    not a distinct color per company — simpler to read at a glance,
+    and avoids picking an arbitrary color palette."""
+    if not highlight_list:
+        return display_df
+
+    def _row_style(row):
+        if row[company_col] in highlight_list:
+            return [f"background-color: {_HIGHLIGHT_COLOR}"] * len(row)
+        return [""] * len(row)
+
+    return display_df.style.apply(_row_style, axis=1)
+
+
 def _search_products_by_name(sheets: dict, search_term: str) -> pd.DataFrame:
     """Searches the common_name column directly on ALL THREE master
     sheets (prod_her/prod_ins/prod_fun) at once — a case-insensitive
@@ -195,7 +235,7 @@ def _search_products_by_name(sheets: dict, search_term: str) -> pd.DataFrame:
     return out.sort_values(["common_name", "category"]).reset_index(drop=True)
 
 
-def _render_by_target(sheets: dict):
+def _render_by_target(sheets: dict, highlight_companies: list):
     stage_df_all = sheets["crop_stage"]
     if stage_df_all.empty:
         st.error("`crop_stage` sheet is missing or empty.")
@@ -313,10 +353,11 @@ def _render_by_target(sheets: dict):
         cfg["cost_col"]: cfg["cost_col"].replace("_", " ").title(),
     })
     st.subheader(f"{target_choice} — {len(display)} product(s) across {display['Company'].nunique()} company(ies)")
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    st.dataframe(_highlight_companies(display, "Company", highlight_companies),
+                 use_container_width=True, hide_index=True)
 
 
-def _render_by_chemical_name(sheets: dict):
+def _render_by_chemical_name(sheets: dict, highlight_companies: list):
     st.caption(
         "Search across ALL crops and categories at once — e.g. type "
         "'copper' to see every copper-based product any company sells, "
@@ -369,7 +410,8 @@ def _render_by_chemical_name(sheets: dict):
     )
     st.subheader(f"'{search_term}' — {len(display)} product(s) across "
                  f"{display['Company'].nunique()} company(ies)")
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    st.dataframe(_highlight_companies(display, "Company", highlight_companies),
+                 use_container_width=True, hide_index=True)
 
 
 def render_price_comparison_view():
@@ -395,9 +437,22 @@ def render_price_comparison_view():
         help="By Target: pick a crop + pest, compare companies. "
              "By Chemical Name: search a chemical (e.g. copper) across everything at once.",
     )
+
+    # Shared across both modes via the same widget key, so picking your
+    # company(ies) once carries over whether you're in By Target or By
+    # Chemical Name — no need to reselect when switching. Sourced from
+    # every company across all three master sheets, not just whatever's
+    # currently filtered/visible, so the picker stays stable regardless
+    # of crop/category/search selections made elsewhere on the page.
+    all_companies = _all_companies(sheets)
+    highlight_companies = st.multiselect(
+        "Highlight companies", all_companies, key="price_highlight_companies",
+        help="Selected companies' rows are shaded in the results table below — "
+             "e.g. highlight your own company, or a couple of key competitors.",
+    )
     st.divider()
 
     if mode == "By Target":
-        _render_by_target(sheets)
+        _render_by_target(sheets, highlight_companies)
     else:
-        _render_by_chemical_name(sheets)
+        _render_by_chemical_name(sheets, highlight_companies)
