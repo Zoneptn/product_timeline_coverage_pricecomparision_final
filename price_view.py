@@ -163,6 +163,77 @@ def _all_companies(sheets: dict) -> list:
     return sorted(companies)
 
 
+def _companies_for_category(sheets: dict, cfg: dict) -> list:
+    """Companies appearing in just ONE category's master sheet — used
+    by Portfolio Cost mode, which is scoped to a single category, so
+    offering companies from other categories would just be noise (they
+    couldn't have a product to contribute to this comparison anyway)."""
+    master = sheets.get(cfg["master"], pd.DataFrame())
+    if master.empty or "company" not in master.columns:
+        return []
+    return sorted({str(c).strip() for c in master["company"].dropna() if str(c).strip()})
+
+
+def _portfolio_cost_table(sheets: dict, cfg: dict, crop_id, target_ids: list,
+                           target_names: dict, companies: list) -> pd.DataFrame:
+    """For each selected company, sums the CHEAPEST available product's
+    cost across all selected targets — a company's own total is only
+    ever built from real per-target lookups already used elsewhere
+    (_price_comparison_table), so this never invents a price. A company
+    missing a product for one or more targets still gets a partial
+    total (sum of whatever it does cover) plus a 'missing' count/list,
+    rather than being silently dropped or blocked from showing anything
+    at all — a real gap is exactly the kind of thing this view exists
+    to surface. NOT for combining categories: units differ (per rai vs
+    per 20L tank), so target_ids must all come from the SAME category."""
+    # Reuses the existing per-target lookup (_price_comparison_table)
+    # rather than re-deriving costs — one call per target, grouped down
+    # to each company's cheapest product for that target.
+    per_target_company_cost = {}  # target_id -> {company: cheapest cost}
+    for tid in target_ids:
+        t = _price_comparison_table(sheets, cfg, crop_id, tid, ascending=True)
+        if t.empty:
+            per_target_company_cost[tid] = {}
+            continue
+        t = t.copy()
+        t["_cost_num"] = pd.to_numeric(t[cfg["cost_col"]], errors="coerce")
+        per_target_company_cost[tid] = t.dropna(subset=["_cost_num"]).groupby("company")["_cost_num"].min().to_dict()
+
+    n_targets = len(target_ids)
+    rows = []
+    for company in companies:
+        total = 0.0
+        covered = 0
+        missing = []
+        for tid in target_ids:
+            cost = per_target_company_cost.get(tid, {}).get(company)
+            if cost is not None:
+                total += cost
+                covered += 1
+            else:
+                missing.append(target_names.get(tid, str(tid)))
+        rows.append({
+            "company": company,
+            "covered": covered,
+            "total_targets": n_targets,
+            "total_cost": total if covered > 0 else None,
+            "missing_targets": "; ".join(missing) if missing else "",
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    # Fully-covered companies first (cheapest first among those), then
+    # partial coverage (cheapest partial total first), matching the
+    # instinct that "cheapest AND complete" beats "cheapest but missing
+    # something" — a low total that hides a real gap shouldn't outrank
+    # a slightly higher, fully-covered one.
+    out["_fully_covered"] = out["covered"] == out["total_targets"]
+    out = out.sort_values(
+        ["_fully_covered", "total_cost"], ascending=[False, True], na_position="last"
+    ).drop(columns=["_fully_covered"])
+    return out.reset_index(drop=True)
+
+
 # Soft, visible-but-not-garish highlight — distinct from the app's
 # other colors (red/green coverage status, tier/efficiency badges) so
 # it doesn't get visually confused with any of those.
@@ -418,6 +489,85 @@ def _render_by_chemical_name(sheets: dict, highlight_companies: list):
                  use_container_width=True, hide_index=True)
 
 
+def _render_portfolio_cost(sheets: dict, highlight_companies: list):
+    st.caption(
+        "Pick several targets in ONE category — see each company's total "
+        "cost to cover all of them (using their cheapest product per "
+        "target), plus a flag for anyone missing coverage on one or more. "
+        "Note: this can't yet mix categories into one number, since ฿/rai "
+        "(Herbicide) and ฿/20L tank (Insecticide/Fungicide) aren't the "
+        "same unit — pick one category per comparison for now."
+    )
+
+    stage_df_all = sheets["crop_stage"]
+    if stage_df_all.empty:
+        st.error("`crop_stage` sheet is missing or empty.")
+        st.stop()
+    crop_lookup = stage_df_all[["crop_id", "crop"]].drop_duplicates()
+    crop_name_to_id = dict(zip(crop_lookup["crop"], crop_lookup["crop_id"]))
+
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
+        crop_choice = st.selectbox("Crop", list(crop_name_to_id.keys()), key="pf_crop")
+    crop_id = crop_name_to_id[crop_choice]
+    with col2:
+        category_choice = st.selectbox("Category", list(PRICE_CATEGORY_CONFIG.keys()), key="pf_category")
+    with col3:
+        lang_choice = st.radio("Name language", ["English", "Thai"], horizontal=True, key="pf_lang")
+    cfg = PRICE_CATEGORY_CONFIG[category_choice]
+    name_col = "name_en" if lang_choice == "English" else "name_th"
+
+    targets = _price_target_options(sheets, cfg, crop_id)
+    if targets.empty:
+        st.info(f"No {category_choice.lower()} targets found for this crop.")
+        st.stop()
+
+    target_name_to_id = dict(zip(targets[name_col], targets[cfg["target_id_col"]]))
+    target_choices = st.multiselect(
+        f"{category_choice.split(' ')[0]} targets to include",
+        list(target_name_to_id.keys()), key="pf_targets",
+    )
+    if not target_choices:
+        st.info("Pick at least one target above to build a portfolio comparison.")
+        return
+    target_ids = [target_name_to_id[t] for t in target_choices]
+    target_names = {tid: name for name, tid in target_name_to_id.items() if tid in target_ids}
+
+    category_companies = _companies_for_category(sheets, cfg)
+    if not category_companies:
+        st.info(f"No companies found for {category_choice.lower()} on this crop.")
+        st.stop()
+    companies_choice = st.multiselect(
+        "Companies to compare", category_companies, key="pf_companies",
+        default=[c for c in highlight_companies if c in category_companies] or None,
+        help="Defaults to whatever you picked in 'Highlight companies' above, if applicable.",
+    )
+    if not companies_choice:
+        st.info("Pick at least one company above to compare.")
+        return
+
+    table = _portfolio_cost_table(sheets, cfg, crop_id, target_ids, target_names, companies_choice)
+    if table.empty:
+        st.info("No data to show for this selection.")
+        return
+
+    display = table.copy()
+    display["Coverage"] = display.apply(
+        lambda r: f"{r['covered']}/{r['total_targets']}"
+        + (" ⚠️" if r["covered"] < r["total_targets"] else " ✅"),
+        axis=1,
+    )
+    display["Total Cost"] = display["total_cost"].apply(
+        lambda v: (_format_price(v) + f"/{cfg['cost_unit_label']} (total)") if v is not None and not pd.isna(v) else "—"
+    )
+    display = display.rename(columns={"company": "Company", "missing_targets": "Missing Targets"})
+    display = display[["Company", "Coverage", "Total Cost", "Missing Targets"]]
+
+    st.subheader(f"Portfolio cost across {len(target_ids)} {category_choice.split(' ')[0].lower()} target(s)")
+    st.dataframe(_highlight_companies(display, "Company", highlight_companies),
+                 use_container_width=True, hide_index=True)
+
+
 def render_price_comparison_view():
     st.title("💰 Price Comparison")
     st.caption("Compare every company's product for a specific weed, pest, or disease.")
@@ -437,9 +587,10 @@ def render_price_comparison_view():
         st.stop()
 
     mode = st.radio(
-        "Compare mode", ["By Target", "By Chemical Name"], horizontal=True, key="price_mode",
+        "Compare mode", ["By Target", "By Chemical Name", "Portfolio Cost"], horizontal=True, key="price_mode",
         help="By Target: pick a crop + pest, compare companies. "
-             "By Chemical Name: search a chemical (e.g. copper) across everything at once.",
+             "By Chemical Name: search a chemical (e.g. copper) across everything at once. "
+             "Portfolio Cost: total cost across several targets at once, per company.",
     )
 
     # Shared across both modes via the same widget key, so picking your
@@ -458,5 +609,7 @@ def render_price_comparison_view():
 
     if mode == "By Target":
         _render_by_target(sheets, highlight_companies)
-    else:
+    elif mode == "By Chemical Name":
         _render_by_chemical_name(sheets, highlight_companies)
+    else:
+        _render_portfolio_cost(sheets, highlight_companies)
