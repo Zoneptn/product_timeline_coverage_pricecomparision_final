@@ -85,28 +85,84 @@ def _price_target_options(sheets: dict, cfg: dict, crop_id, stage_filter: str = 
     ).sort_values("name_en")
 
 
+def _target_ws_ids(sheets: dict, cfg: dict, crop_id, target_id, stage_filter: str = None):
+    """Herbicide only (cfg has 'stage_col'): resolves which specific
+    ws_id window(s) correspond to this weed under the CURRENT Spray
+    Timing filter, so the price lookup can be scoped to just that
+    timing rather than silently aggregating every timing regardless of
+    what was selected — that silent aggregation was the actual bug
+    behind 'All' and a specific timing showing identical numbers.
+    Returns None (no restriction — every window for this weed is
+    already what the lookup uses without this) when there's no stage
+    concept at all (Insect/Disease) or stage_filter is None/'All'."""
+    stage_col = cfg.get("stage_col")
+    if not stage_col or not stage_filter:
+        return None
+    window_df = sheets.get(cfg["window_sheet"], pd.DataFrame())
+    if window_df.empty or "ws_id" not in window_df.columns:
+        return None
+    w = window_df[
+        (window_df["crop_id"] == crop_id)
+        & (window_df[cfg["target_id_col"]] == target_id)
+        & (window_df[stage_col].astype(str).str.strip() == stage_filter)
+    ]
+    return w["ws_id"].dropna().unique().tolist()
+
+
 def _price_comparison_table(sheets: dict, cfg: dict, crop_id, target_id,
-                             ascending: bool = True) -> pd.DataFrame:
-    """Every company's product linked to this target, across ALL windows
-    that target appears in (deduped down to one row per product — price/
-    size/usage/tier are product-level attributes and don't vary by
-    window, only efficiency might, so efficiency is shown as a mix if it
-    does, alongside a 'best_efficiency' column used for filtering — see
-    render_price_comparison_view's Minimum Efficiency control). ascending=True
-    sorts cheapest first, False sorts priciest first; rows with no price
-    data always sort to the bottom either way so they never get mistaken
-    for the cheapest (or most expensive) option."""
+                             ascending: bool = True, ws_ids: list = None) -> pd.DataFrame:
+    """Every company's product linked to this target. ws_ids, when given
+    (Herbicide only — see _target_ws_ids), restricts this to just the
+    window(s) matching the current Spray Timing filter; None means no
+    restriction (every window for this target, i.e. 'All' timing).
+
+    For Herbicide specifically (cfg has 'stage_col'), rows are grouped
+    by (product, spray timing) rather than by product alone — the SAME
+    product can have different efficiency at different timings (tied to
+    a specific ws_id in weed_her), so blending them into one row would
+    hide that difference. This means with 'All' selected, a product
+    used at both Early Post and Late Post shows as two separate rows,
+    each tagged with its own Spray Timing — that's what actually lets
+    'All' genuinely combine every timing instead of quietly picking
+    just one. Insect/Disease have no stage concept, so they keep the
+    original one-row-per-product behavior untouched, no Spray Timing
+    column at all.
+
+    price/size/usage/tier are product-level attributes and don't vary
+    by window, only efficiency (and, for Herbicide, spray_timing) might.
+    A 'best_efficiency' column is also included, used for filtering —
+    see render_price_comparison_view's Minimum Efficiency control.
+    ascending=True sorts cheapest first, False sorts priciest first;
+    rows with no price data always sort to the bottom either way so
+    they never get mistaken for the cheapest (or most expensive)
+    option."""
     junction = sheets.get(cfg["junction"], pd.DataFrame())
     master = sheets.get(cfg["master"], pd.DataFrame())
     j_id, m_id = cfg["junction_id"], cfg["master_id"]
-    empty_cols = ["company", "trade_name", "common_name", "tier", "efficiency",
-                  "price", "size", "usage", cfg["cost_col"]]
+    has_stage = bool(cfg.get("stage_col")) and "ws_id" in junction.columns
+    base_cols = ["company", "trade_name", "common_name", "tier", "efficiency",
+                 "price", "size", "usage", cfg["cost_col"]]
+    empty_cols = base_cols + (["spray_timing"] if has_stage else [])
     if junction.empty or master.empty or j_id not in junction.columns or m_id not in master.columns:
         return pd.DataFrame(columns=empty_cols)
 
     j = junction[(junction["crop_id"] == crop_id) & (junction[cfg["target_id_col"]] == target_id)].copy()
+    if ws_ids is not None and "ws_id" in j.columns:
+        j = j[j["ws_id"].isin(ws_ids)]
     if j.empty:
         return pd.DataFrame(columns=empty_cols)
+
+    # Map each junction row's ws_id to its spray-timing label (from the
+    # window sheet, e.g. crop_weeds) so it can be shown per row and used
+    # as part of the grouping key below.
+    if has_stage:
+        window_df = sheets.get(cfg["window_sheet"], pd.DataFrame())
+        stage_col = cfg["stage_col"]
+        if not window_df.empty and "ws_id" in window_df.columns and stage_col in window_df.columns:
+            ws_to_stage = window_df.drop_duplicates(subset=["ws_id"]).set_index("ws_id")[stage_col].to_dict()
+            j["spray_timing"] = j["ws_id"].map(ws_to_stage)
+        else:
+            j["spray_timing"] = None
 
     overlap = [c for c in j.columns if c in master.columns and c != j_id]
     j = j.drop(columns=overlap)
@@ -116,7 +172,8 @@ def _price_comparison_table(sheets: dict, cfg: dict, crop_id, target_id,
         return pd.DataFrame(columns=empty_cols)
 
     rows = []
-    for pid, g in merged.groupby(m_id, dropna=False):
+    group_cols = [m_id, "spray_timing"] if has_stage else [m_id]
+    for _, g in merged.groupby(group_cols, dropna=False):
         first = g.iloc[0]
         raw_efficiencies = [normalize_efficiency(v) for v in g.get("efficiency", pd.Series(dtype=object))]
         efficiencies_present = {e for e in raw_efficiencies if e is not None}
@@ -130,7 +187,7 @@ def _price_comparison_table(sheets: dict, cfg: dict, crop_id, target_id,
         # its worst). Used by the Minimum Efficiency filter below;
         # dropped before the table is displayed.
         best_efficiency = next((e for e in EFFICIENCY_ORDER if e in efficiencies_present), "Unrated")
-        rows.append({
+        row = {
             "company": first.get("company", ""),
             "trade_name": first.get("trade_name", ""),
             "common_name": first.get("common_name", ""),
@@ -141,7 +198,10 @@ def _price_comparison_table(sheets: dict, cfg: dict, crop_id, target_id,
             "size": first.get("size"),
             "usage": first.get("usage"),
             cfg["cost_col"]: first.get(cfg["cost_col"]),
-        })
+        }
+        if has_stage:
+            row["spray_timing"] = first.get("spray_timing") or "—"
+        rows.append(row)
     out = pd.DataFrame(rows, columns=empty_cols + ["best_efficiency"])
     out["_sort_cost"] = pd.to_numeric(out[cfg["cost_col"]], errors="coerce")
     out = out.sort_values("_sort_cost", ascending=ascending, na_position="last").drop(columns=["_sort_cost"])
@@ -174,16 +234,23 @@ def _companies_for_category(sheets: dict, cfg: dict) -> list:
     return sorted({str(c).strip() for c in master["company"].dropna() if str(c).strip()})
 
 
-def _portfolio_target_options(sheets: dict, cfg: dict, crop_id, target_ids: list) -> dict:
+def _portfolio_target_options(sheets: dict, cfg: dict, crop_id, target_ids: list,
+                               stage_filter: str = None) -> dict:
     """Every available product option per (company, target) pair, sorted
     cheapest first — the raw material behind both the auto-cheapest
     default and the optional manual override (see 'Customize product
     picks' in _render_portfolio_cost). Reuses _price_comparison_table
     per target, same as before, just keeping every row instead of
-    collapsing straight to the cheapest one."""
+    collapsing straight to the cheapest one.
+
+    stage_filter (Herbicide only) scopes each target's lookup to the
+    matching ws_id window(s) — same fix as in _render_by_target, so
+    'All' vs a specific timing actually produce different results here
+    too, instead of both silently pulling every timing regardless."""
     options = {}  # (company, target_id) -> [(trade_name, cost), ...] sorted by cost asc
     for tid in target_ids:
-        t = _price_comparison_table(sheets, cfg, crop_id, tid, ascending=True)
+        ws_ids = _target_ws_ids(sheets, cfg, crop_id, tid, stage_filter)
+        t = _price_comparison_table(sheets, cfg, crop_id, tid, ascending=True, ws_ids=ws_ids)
         if t.empty:
             continue
         t = t.copy()
@@ -410,8 +477,15 @@ def _render_by_target(sheets: dict, highlight_companies: list):
                                 horizontal=True, key="price_sort")
     target_id = target_name_to_id[target_choice]
 
+    # Scope the price lookup to the currently selected Spray Timing —
+    # None (no restriction) when "All" is chosen, or the exact ws_id
+    # window(s) for a specific timing otherwise. Without this, "All"
+    # and any single timing would silently return identical results,
+    # since the underlying junction lookup ignores timing unless told
+    # which windows to restrict to.
+    ws_ids = _target_ws_ids(sheets, cfg, crop_id, target_id, stage_filter)
     table = _price_comparison_table(sheets, cfg, crop_id, target_id,
-                                     ascending=(sort_choice == "Cheapest first"))
+                                     ascending=(sort_choice == "Cheapest first"), ws_ids=ws_ids)
     if table.empty:
         st.info(f"No products found across any company for {target_choice}.")
         st.stop()
@@ -475,6 +549,7 @@ def _render_by_target(sheets: dict, highlight_companies: list):
     display = display.rename(columns={
         "company": "Company", "trade_name": "Trade Name", "common_name": "Common Name",
         "tier": "Tier", "efficiency": "Efficiency", "price": "Price", "size": "Size", "usage": "Usage",
+        "spray_timing": "Spray Timing",
         cfg["cost_col"]: cfg["cost_col"].replace("_", " ").title(),
     })
     st.subheader(f"{target_choice} — {len(display)} product(s) across {display['Company'].nunique()} company(ies)")
@@ -614,7 +689,7 @@ def _render_portfolio_cost(sheets: dict, highlight_companies: list):
         st.info("Pick at least one company above to compare.")
         return
 
-    all_options = _portfolio_target_options(sheets, cfg, crop_id, target_ids)
+    all_options = _portfolio_target_options(sheets, cfg, crop_id, target_ids, stage_filter=stage_filter)
     picks = _default_picks(all_options)
 
     # Customize product picks — off by default (auto-cheapest, exactly
