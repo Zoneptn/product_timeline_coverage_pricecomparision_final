@@ -63,7 +63,14 @@ def _latest_prices_from_history(price_history_df: pd.DataFrame, category_label: 
     ].copy()
     if df.empty:
         return pd.Series(dtype=float)
-    df["snapshot_date"] = pd.to_datetime(df["snapshot_date"], errors="coerce")
+    # dayfirst=True as a defensive backstop: pandas assumes month-first
+    # (MM-DD-YYYY) by default, which would silently misread a DD-MM-YYYY
+    # string (e.g. a date typed by hand in Excel) for any day-of-month
+    # <=12 — no error, just a wrong "latest" snapshot picked from then
+    # on. This doesn't help if dates are ALREADY ambiguous both ways in
+    # the same column, but it matches the day-first convention used
+    # when writing new snapshot rows (see update_price_example.py).
+    df["snapshot_date"] = pd.to_datetime(df["snapshot_date"], errors="coerce", dayfirst=True)
     df["product_id"] = df["product_id"].astype(str).str.strip()
     df = df.dropna(subset=["snapshot_date"])
     if df.empty:
