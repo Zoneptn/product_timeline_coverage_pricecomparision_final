@@ -151,6 +151,51 @@ def _products_for_selection(sheets: dict, cfg: dict, crop_id, target_id=None,
     return set(j[j_id].astype(str).str.strip())
 
 
+def _crop_category_timing_selector(sheets: dict, key_prefix: str):
+    """Renders Crop -> Category -> (Spray Timing, Herbicide only),
+    shared by both Recent Changes and Price Trend Chart so their
+    behavior can never quietly diverge. key_prefix keeps each mode's
+    widget state independent, so switching modes doesn't reset the
+    other mode's selections.
+
+    Returns (crop_choice, category_choice, stage_filter, crop_id, cfg).
+    cfg is None unless both crop and category are specific — callers
+    need it for further lookups (target options, _products_for_selection)."""
+    stage_df_all = sheets.get("crop_stage", pd.DataFrame())
+    crop_names = sorted(stage_df_all["crop"].dropna().astype(str).unique().tolist()) \
+        if not stage_df_all.empty and "crop" in stage_df_all.columns else []
+    crop_lookup = dict(zip(stage_df_all.get("crop", []), stage_df_all.get("crop_id", [])))
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        crop_choice = st.selectbox("Crop", ["All"] + crop_names, key=f"{key_prefix}_crop")
+    with col_b:
+        category_choice = st.selectbox("Category", CATEGORY_OPTIONS, key=f"{key_prefix}_category")
+
+    stage_filter = None
+    cfg = None
+    crop_id = crop_lookup.get(crop_choice) if crop_choice != "All" else None
+
+    if crop_choice != "All" and category_choice != "All":
+        cfg = PRICE_CATEGORY_CONFIG[_CATEGORY_TO_CONFIG_KEY[category_choice]]
+        if category_choice == "Herbicide":
+            stage_options = _price_stage_options(sheets, cfg, crop_id)
+            if stage_options:
+                stage_choice = st.selectbox("Spray Timing", ["All"] + stage_options, key=f"{key_prefix}_stage")
+                stage_filter = None if stage_choice == "All" else stage_choice
+
+    return crop_choice, category_choice, stage_filter, crop_id, cfg
+
+
+def _spray_timing_display(category_choice: str, stage_filter: str) -> str:
+    """'N/A' for categories with no timing concept (Insecticide/
+    Fungicide/All), so the summary line doesn't imply a timing concept
+    exists where it doesn't."""
+    if category_choice == "Herbicide":
+        return stage_filter if stage_filter else "All"
+    return "N/A"
+
+
 def _render_recent_changes(sheets: dict, price_history: pd.DataFrame):
     st.caption(
         "What changed between the two most recent price-update rounds, "
@@ -165,44 +210,12 @@ def _render_recent_changes(sheets: dict, price_history: pd.DataFrame):
                  "check back after the next update round.")
         st.stop()
 
-    # --- Crop -> Category -> (Spray Timing, Herbicide only) -> Target ---
-    # These four only narrow anything once BOTH crop and category are
-    # specific — price_history has no crop/pest linkage of its own, so
-    # this cross-references product_id against the junction sheets
-    # price_view.py already uses for the same purpose. Left at "All",
-    # this section is a no-op and the table behaves exactly as before.
-    stage_df_all = sheets.get("crop_stage", pd.DataFrame())
-    crop_names = sorted(stage_df_all["crop"].dropna().astype(str).unique().tolist()) \
-        if not stage_df_all.empty and "crop" in stage_df_all.columns else []
-    crop_lookup = dict(zip(stage_df_all.get("crop", []), stage_df_all.get("crop_id", [])))
-
-    col_a, col_b, col_lang = st.columns([2, 2, 1])
-    with col_a:
-        crop_choice = st.selectbox("Crop", ["All"] + crop_names, key="pm_crop")
-    with col_b:
-        category_choice = st.selectbox("Category", CATEGORY_OPTIONS, key="pm_category")
-    with col_lang:
-        lang_choice = st.radio("Name language", ["English", "Thai"], horizontal=True, key="pm_lang")
+    crop_choice, category_choice, stage_filter, crop_id, cfg = _crop_category_timing_selector(sheets, "pm")
 
     target_choice = "All"
-    stage_filter = None
-    cfg = None
     target_name_to_id = {}
-    crop_id = crop_lookup.get(crop_choice) if crop_choice != "All" else None
-
     if crop_choice != "All" and category_choice != "All":
-        cfg = PRICE_CATEGORY_CONFIG[_CATEGORY_TO_CONFIG_KEY[category_choice]]
-        stage_options = _price_stage_options(sheets, cfg, crop_id) if category_choice == "Herbicide" else []
-
-        if stage_options:
-            col_c, col_d = st.columns(2)
-            with col_c:
-                stage_choice = st.selectbox("Spray Timing", ["All"] + stage_options, key="pm_stage")
-                stage_filter = None if stage_choice == "All" else stage_choice
-            target_slot = col_d
-        else:
-            target_slot = st
-
+        lang_choice = st.radio("Name language", ["English", "Thai"], horizontal=True, key="pm_lang")
         targets_df = _price_target_options(sheets, cfg, crop_id, stage_filter=stage_filter)
         # Falls back to English if the Thai name column isn't present in
         # this sheet yet (or vice versa) — same defensive pattern used
@@ -213,10 +226,7 @@ def _render_recent_changes(sheets: dict, price_history: pd.DataFrame):
                 targets_df.columns[0] if not targets_df.empty else "name_en"))
         target_options = targets_df[name_col].dropna().astype(str).tolist() if not targets_df.empty else []
         target_name_to_id = dict(zip(targets_df.get(name_col, []), targets_df.get(cfg["target_id_col"], [])))
-
-        target_choice = target_slot.selectbox(
-            "Target (pest/weed/disease)", ["All"] + target_options, key="pm_target"
-        )
+        target_choice = st.selectbox("Target (pest/weed/disease)", ["All"] + target_options, key="pm_target")
 
     # Company options come from every company with at least one recorded
     # price change (the unfiltered `table`), not from `filtered` — kept
@@ -232,18 +242,10 @@ def _render_recent_changes(sheets: dict, price_history: pd.DataFrame):
         direction_choice = st.radio("Direction", ["All", "Increases only", "Decreases only"],
                                      horizontal=True, key="pm_direction")
 
-    # Spray Timing only has a real value when Herbicide is selected —
-    # shown as "N/A" otherwise rather than "All", so it doesn't imply a
-    # timing concept exists for Insecticide/Fungicide (it doesn't).
-    if category_choice == "Herbicide":
-        spray_timing_display = stage_filter if stage_filter else "All"
-    else:
-        spray_timing_display = "N/A"
-
     st.markdown(
         f"**Crop:** {crop_choice} &nbsp;|&nbsp; "
         f"**Category:** {category_choice} &nbsp;|&nbsp; "
-        f"**Spray Timing:** {spray_timing_display} &nbsp;|&nbsp; "
+        f"**Spray Timing:** {_spray_timing_display(category_choice, stage_filter)} &nbsp;|&nbsp; "
         f"**Company:** {company_choice}"
     )
 
@@ -301,7 +303,7 @@ def _search_price_history_by_name(price_history: pd.DataFrame, search_term: str)
     return price_history[mask].copy()
 
 
-def _render_price_trend_chart(price_history: pd.DataFrame):
+def _render_price_trend_chart(sheets: dict, price_history: pd.DataFrame):
     st.caption(
         "Search a chemical/active-ingredient name (e.g. 'copper', "
         "'glyphosate') to see how its price has moved over time — one "
@@ -313,6 +315,21 @@ def _render_price_trend_chart(price_history: pd.DataFrame):
         "unit-mixing risk, unlike the derived cost metrics used "
         "elsewhere in this app."
     )
+
+    crop_choice, category_choice, stage_filter, crop_id, cfg = _crop_category_timing_selector(sheets, "pt_chart")
+
+    company_options_all = ["All"] + sorted(
+        price_history["company"].dropna().astype(str).str.strip().unique().tolist()
+    ) if "company" in price_history.columns else ["All"]
+    company_choice = st.selectbox("Company", company_options_all, key="pt_chart_company")
+
+    st.markdown(
+        f"**Crop:** {crop_choice} &nbsp;|&nbsp; "
+        f"**Category:** {category_choice} &nbsp;|&nbsp; "
+        f"**Spray Timing:** {_spray_timing_display(category_choice, stage_filter)} &nbsp;|&nbsp; "
+        f"**Company:** {company_choice}"
+    )
+
     search_term = st.text_input(
         "Search by chemical / common name", key="pt_chart_search",
         placeholder="e.g. copper, glyphosate, mancozeb",
@@ -324,6 +341,24 @@ def _render_price_trend_chart(price_history: pd.DataFrame):
     matches = _search_price_history_by_name(price_history, search_term)
     if matches.empty:
         st.info(f"No price history found matching '{search_term}'.")
+        return
+
+    # Crop/Category/Timing/Company narrow the search results further —
+    # combined as AND conditions with the chemical-name search above.
+    # Crop/Timing require the same junction-sheet cross-reference used
+    # in Recent Changes (price_history has no crop/pest linkage of its
+    # own); Category/Company are simple column filters on price_history
+    # itself.
+    if category_choice != "All":
+        matches = matches[matches["category"] == category_choice]
+    if crop_choice != "All" and category_choice != "All":
+        product_ids = _products_for_selection(sheets, cfg, crop_id, target_id=None, stage_filter=stage_filter)
+        matches = matches[matches["product_id"].astype(str).str.strip().isin(product_ids)]
+    if company_choice != "All":
+        matches = matches[matches["company"] == company_choice]
+
+    if matches.empty:
+        st.info(f"No price history matches '{search_term}' with these filters.")
         return
 
     # One identity per (product_id, category, company, trade_name) --
@@ -424,4 +459,4 @@ def render_price_trend_view():
     if mode == "Recent Changes":
         _render_recent_changes(sheets, price_history)
     else:
-        _render_price_trend_chart(price_history)
+        _render_price_trend_chart(sheets, price_history)
