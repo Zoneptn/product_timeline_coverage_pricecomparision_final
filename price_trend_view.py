@@ -11,6 +11,16 @@ price_history's raw snapshots) from price_view.py's four modes, which
 are all about comparing companies' CURRENT prices against each other
 for a specific pest/weed/disease target. price_view.py was already
 large; this avoids growing it further with an unrelated concern.
+
+price_history itself is purely product-level (no crop/pest linkage at
+all) — so narrowing "what changed" down to a specific crop, category,
+spray timing, or target pest/weed/disease means cross-referencing a
+product_id against the same junction sheets (weed_her/pest_ins/
+disease_fun) that price_view.py already uses for its target lookups.
+Rather than reimplementing that, this file imports and reuses
+price_view.py's PRICE_CATEGORY_CONFIG / _price_stage_options /
+_price_target_options / _target_ws_ids directly, so the two files can
+never quietly disagree about how targets or timings are resolved.
 """
 
 import streamlit as st
@@ -18,8 +28,22 @@ import pandas as pd
 
 from shared import _format_price
 from data_cov import DEFAULT_PATH_COV, load_workbook_cov, get_file_cov
+from price_view import (
+    PRICE_CATEGORY_CONFIG, _price_stage_options, _price_target_options, _target_ws_ids,
+)
 
 CATEGORY_OPTIONS = ["All", "Herbicide", "Insecticide", "Fungicide"]
+
+# price_trend_view uses short category labels (matching price_history's
+# own "category" column) in its UI/filtering; price_view.py's config
+# dict is keyed by the longer display labels used in ITS dropdowns.
+# This maps one to the other so both files can describe "Herbicide"
+# without needing to agree on a single label everywhere.
+_CATEGORY_TO_CONFIG_KEY = {
+    "Herbicide": "Herbicide (Weed)",
+    "Insecticide": "Insecticide (Insect)",
+    "Fungicide": "Fungicide (Disease)",
+}
 
 
 def _price_movement_table(price_history: pd.DataFrame) -> pd.DataFrame:
@@ -91,6 +115,41 @@ def _price_movement_table(price_history: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def _products_for_selection(sheets: dict, cfg: dict, crop_id, target_id=None,
+                             stage_filter: str = None) -> set:
+    """Product IDs (the master sheet's own id values — e.g. her_id) linked
+    to this crop, via the category's junction sheet — optionally
+    narrowed to one specific target and/or (Herbicide only) one spray
+    timing. target_id=None means 'any target for this crop/category' —
+    still respecting stage_filter if given, checked across every weed
+    at that timing, not just one. Returns an empty set if the junction
+    sheet is missing/empty or lacks the needed columns — callers treat
+    that as 'nothing matches', same as any other missing-data case."""
+    junction = sheets.get(cfg["junction"], pd.DataFrame())
+    j_id = cfg["junction_id"]
+    if junction.empty or "crop_id" not in junction.columns or j_id not in junction.columns:
+        return set()
+
+    j = junction[junction["crop_id"] == crop_id]
+    if target_id is not None:
+        j = j[j[cfg["target_id_col"]] == target_id]
+
+    stage_col = cfg.get("stage_col")
+    if stage_col and stage_filter and "ws_id" in j.columns:
+        window_df = sheets.get(cfg["window_sheet"], pd.DataFrame())
+        if not window_df.empty and "ws_id" in window_df.columns and stage_col in window_df.columns:
+            w = window_df[
+                (window_df["crop_id"] == crop_id)
+                & (window_df[stage_col].astype(str).str.strip() == stage_filter)
+            ]
+            if target_id is not None:
+                w = w[w[cfg["target_id_col"]] == target_id]
+            valid_ws_ids = set(w["ws_id"].dropna())
+            j = j[j["ws_id"].isin(valid_ws_ids)]
+
+    return set(j[j_id].astype(str).str.strip())
+
+
 def render_price_trend_view():
     st.title("📈 Price Movement")
     st.caption(
@@ -125,26 +184,75 @@ def render_price_trend_view():
                  "check back after the next update round.")
         st.stop()
 
+    # --- Crop -> Category -> (Spray Timing, Herbicide only) -> Target ---
+    # These four only narrow anything once BOTH crop and category are
+    # specific — price_history has no crop/pest linkage of its own, so
+    # this cross-references product_id against the junction sheets
+    # price_view.py already uses for the same purpose. Left at "All",
+    # this section is a no-op and the table behaves exactly as before.
+    stage_df_all = sheets.get("crop_stage", pd.DataFrame())
+    crop_names = sorted(stage_df_all["crop"].dropna().astype(str).unique().tolist()) \
+        if not stage_df_all.empty and "crop" in stage_df_all.columns else []
+    crop_lookup = dict(zip(stage_df_all.get("crop", []), stage_df_all.get("crop_id", [])))
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        crop_choice = st.selectbox("Crop", ["All"] + crop_names, key="pm_crop")
+    with col_b:
+        category_choice = st.selectbox("Category", CATEGORY_OPTIONS, key="pm_category")
+
+    target_choice = "All"
+    stage_filter = None
+    cfg = None
+    target_name_to_id = {}
+    crop_id = crop_lookup.get(crop_choice) if crop_choice != "All" else None
+
+    if crop_choice != "All" and category_choice != "All":
+        cfg = PRICE_CATEGORY_CONFIG[_CATEGORY_TO_CONFIG_KEY[category_choice]]
+        stage_options = _price_stage_options(sheets, cfg, crop_id) if category_choice == "Herbicide" else []
+
+        if stage_options:
+            col_c, col_d = st.columns(2)
+            with col_c:
+                stage_choice = st.selectbox("Spray Timing", ["All"] + stage_options, key="pm_stage")
+                stage_filter = None if stage_choice == "All" else stage_choice
+            target_slot = col_d
+        else:
+            target_slot = st
+
+        targets_df = _price_target_options(sheets, cfg, crop_id, stage_filter=stage_filter)
+        name_col = "name_en" if "name_en" in targets_df.columns else (
+            targets_df.columns[0] if not targets_df.empty else "name_en")
+        target_options = targets_df[name_col].dropna().astype(str).tolist() if not targets_df.empty else []
+        target_name_to_id = dict(zip(targets_df.get(name_col, []), targets_df.get(cfg["target_id_col"], [])))
+
+        target_choice = target_slot.selectbox(
+            "Target (pest/weed/disease)", ["All"] + target_options, key="pm_target"
+        )
+
     # Company options come from every company with at least one recorded
     # price change (the unfiltered `table`), not from `filtered` — kept
-    # independent of the Category/Direction picks below, same as
-    # Category itself doesn't narrow based on Direction. Cascading
-    # filters (where one dropdown's options shift based on another)
-    # would be more surprising here than useful.
+    # independent of the other filters below, same as Category doesn't
+    # narrow based on Direction. Cascading filters (where one dropdown's
+    # options shift based on another) would be more surprising here
+    # than useful.
     company_options = ["All"] + sorted(table["company"].dropna().astype(str).str.strip().unique().tolist())
-
-    col1, col2, col3 = st.columns([2, 2, 1])
-    with col1:
-        category_choice = st.selectbox("Category", CATEGORY_OPTIONS, key="pm_category")
-    with col2:
+    col_e, col_f = st.columns([2, 1])
+    with col_e:
         company_choice = st.selectbox("Company", company_options, key="pm_company")
-    with col3:
+    with col_f:
         direction_choice = st.radio("Direction", ["All", "Increases only", "Decreases only"],
                                      horizontal=True, key="pm_direction")
 
     filtered = table.copy()
     if category_choice != "All":
         filtered = filtered[filtered["category"] == category_choice]
+
+    if crop_choice != "All" and category_choice != "All":
+        target_id = target_name_to_id.get(target_choice) if target_choice != "All" else None
+        product_ids = _products_for_selection(sheets, cfg, crop_id, target_id=target_id, stage_filter=stage_filter)
+        filtered = filtered[filtered["product_id"].isin(product_ids)]
+
     if company_choice != "All":
         filtered = filtered[filtered["company"] == company_choice]
     if direction_choice == "Increases only":
