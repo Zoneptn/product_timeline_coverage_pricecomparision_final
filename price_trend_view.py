@@ -232,6 +232,21 @@ def _render_recent_changes(sheets: dict, price_history: pd.DataFrame):
         direction_choice = st.radio("Direction", ["All", "Increases only", "Decreases only"],
                                      horizontal=True, key="pm_direction")
 
+    # Spray Timing only has a real value when Herbicide is selected —
+    # shown as "N/A" otherwise rather than "All", so it doesn't imply a
+    # timing concept exists for Insecticide/Fungicide (it doesn't).
+    if category_choice == "Herbicide":
+        spray_timing_display = stage_filter if stage_filter else "All"
+    else:
+        spray_timing_display = "N/A"
+
+    st.markdown(
+        f"**Crop:** {crop_choice} &nbsp;|&nbsp; "
+        f"**Category:** {category_choice} &nbsp;|&nbsp; "
+        f"**Spray Timing:** {spray_timing_display} &nbsp;|&nbsp; "
+        f"**Company:** {company_choice}"
+    )
+
     filtered = table.copy()
     if category_choice != "All":
         filtered = filtered[filtered["category"] == category_choice]
