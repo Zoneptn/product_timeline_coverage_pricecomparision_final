@@ -26,6 +26,9 @@ never quietly disagree about how targets or timings are resolved.
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import io
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
 
 from shared import _format_price
 from data_cov import DEFAULT_PATH_COV, load_workbook_cov, get_file_cov
@@ -426,10 +429,15 @@ def _stale_price_table(price_history: pd.DataFrame) -> pd.DataFrame:
     row per product, sorted most-stale (longest since update) first.
     Callers apply their own day threshold to decide what counts as
     'flagged' — this function just computes the raw days-since number
-    for every product, unfiltered."""
+    for every product, unfiltered.
+
+    Carries concentration/formulation_type too (not just the identity
+    fields shown on-screen) — these aren't displayed in the on-screen
+    table, but are needed to build a ready-to-fill update file for
+    flagged products (see _build_stale_fillin_workbook)."""
     required = {"snapshot_date", "product_id", "category"}
-    empty_cols = ["category", "company", "trade_name", "common_name", "product_id",
-                  "last_updated", "days_since"]
+    empty_cols = ["category", "company", "trade_name", "common_name", "concentration",
+                  "formulation_type", "product_id", "last_updated", "days_since"]
     if price_history.empty or not required.issubset(price_history.columns):
         return pd.DataFrame(columns=empty_cols)
 
@@ -451,6 +459,8 @@ def _stale_price_table(price_history: pd.DataFrame) -> pd.DataFrame:
             "company": last_row.get("company", ""),
             "trade_name": last_row.get("trade_name", ""),
             "common_name": last_row.get("common_name", ""),
+            "concentration": last_row.get("concentration", ""),
+            "formulation_type": last_row.get("formulation_type", ""),
             "product_id": pid,
             "last_updated": last_date,
             "days_since": (today - last_date).days,
@@ -459,6 +469,52 @@ def _stale_price_table(price_history: pd.DataFrame) -> pd.DataFrame:
     if out.empty:
         return out
     return out.sort_values("days_since", ascending=False).reset_index(drop=True)
+
+
+def _build_stale_fillin_workbook(stale_df: pd.DataFrame) -> bytes:
+    """Builds a ready-to-fill .xlsx matching price_history's exact
+    column order, pre-filled with each flagged product's known identity
+    (product_id, trade_name, common_name, concentration,
+    formulation_type, company) so whoever receives this only needs to
+    type the new price and today's date — not re-type details that
+    already exist. category, snapshot_date, and price are left BLANK
+    on purpose: category for the recipient to confirm, snapshot_date/
+    price because those are exactly what needs updating. Note: category
+    being blank means it must be filled in before this file is merged
+    back via update_price(), since price_history's join logic uses it."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "price_update"
+
+    headers = ["snapshot_date", "product_id", "category", "trade_name",
+               "common_name", "concentration", "formulation_type", "company", "price"]
+    header_font = Font(name="Arial", bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="2A9D8F", end_color="2A9D8F", fill_type="solid")
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for row_idx, (_, r) in enumerate(stale_df.iterrows(), start=2):
+        ws.cell(row=row_idx, column=1, value=None)  # snapshot_date — blank, filled at update time
+        ws.cell(row=row_idx, column=2, value=r.get("product_id", ""))
+        ws.cell(row=row_idx, column=3, value=None)  # category — left blank per request
+        ws.cell(row=row_idx, column=4, value=r.get("trade_name", ""))
+        ws.cell(row=row_idx, column=5, value=r.get("common_name", ""))
+        ws.cell(row=row_idx, column=6, value=r.get("concentration", ""))
+        ws.cell(row=row_idx, column=7, value=r.get("formulation_type", ""))
+        ws.cell(row=row_idx, column=8, value=r.get("company", ""))
+        ws.cell(row=row_idx, column=9, value=None)  # price — blank, to be filled in
+
+    widths = [15, 12, 14, 16, 16, 15, 17, 14, 10]
+    for col_idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
+    ws.freeze_panes = "A2"
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
 
 
 def _render_stale_prices(sheets: dict, price_history: pd.DataFrame):
@@ -526,6 +582,16 @@ def _render_stale_prices(sheets: dict, price_history: pd.DataFrame):
 
     st.subheader(f"⚠️ {len(display)} product(s) haven't been updated in over {threshold_choice}")
     st.dataframe(display, use_container_width=True, hide_index=True)
+
+    fillin_bytes = _build_stale_fillin_workbook(stale)
+    st.download_button(
+        "📥 Download fill-in template for these products",
+        data=fillin_bytes,
+        file_name=f"stale_price_update_{pd.Timestamp.today().strftime('%Y-%m-%d')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="Same columns as price_history, pre-filled with product details. "
+             "category/snapshot_date/price are left blank for the recipient to fill in.",
+    )
 
 
 def render_price_trend_view():
