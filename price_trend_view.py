@@ -474,14 +474,11 @@ def _stale_price_table(price_history: pd.DataFrame) -> pd.DataFrame:
 def _build_stale_fillin_workbook(stale_df: pd.DataFrame) -> bytes:
     """Builds a ready-to-fill .xlsx matching price_history's exact
     column order, pre-filled with each flagged product's known identity
-    (product_id, trade_name, common_name, concentration,
+    (product_id, category, trade_name, common_name, concentration,
     formulation_type, company) so whoever receives this only needs to
     type the new price and today's date — not re-type details that
-    already exist. category, snapshot_date, and price are left BLANK
-    on purpose: category for the recipient to confirm, snapshot_date/
-    price because those are exactly what needs updating. Note: category
-    being blank means it must be filled in before this file is merged
-    back via update_price(), since price_history's join logic uses it."""
+    already exist. snapshot_date and price are left BLANK on purpose,
+    since those are exactly what needs updating."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "price_update"
@@ -499,7 +496,7 @@ def _build_stale_fillin_workbook(stale_df: pd.DataFrame) -> bytes:
     for row_idx, (_, r) in enumerate(stale_df.iterrows(), start=2):
         ws.cell(row=row_idx, column=1, value=None)  # snapshot_date — blank, filled at update time
         ws.cell(row=row_idx, column=2, value=r.get("product_id", ""))
-        ws.cell(row=row_idx, column=3, value=None)  # category — left blank per request
+        ws.cell(row=row_idx, column=3, value=r.get("category", ""))  # derived from price_history, not blank
         ws.cell(row=row_idx, column=4, value=r.get("trade_name", ""))
         ws.cell(row=row_idx, column=5, value=r.get("common_name", ""))
         ws.cell(row=row_idx, column=6, value=r.get("concentration", ""))
