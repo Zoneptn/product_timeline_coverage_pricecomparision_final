@@ -25,6 +25,7 @@ never quietly disagree about how targets or timings are resolved.
 
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
 
 from shared import _format_price
 from data_cov import DEFAULT_PATH_COV, load_workbook_cov, get_file_cov
@@ -150,33 +151,13 @@ def _products_for_selection(sheets: dict, cfg: dict, crop_id, target_id=None,
     return set(j[j_id].astype(str).str.strip())
 
 
-def render_price_trend_view():
-    st.title("📈 Price Movement")
+def _render_recent_changes(sheets: dict, price_history: pd.DataFrame):
     st.caption(
         "What changed between the two most recent price-update rounds, "
         "per product — sorted by biggest movers first. Only products "
         "with at least 2 recorded snapshots show up here; a product "
         "with just one price entry so far has nothing to compare yet."
     )
-
-    data_file = get_file_cov()
-    if data_file is None:
-        st.warning(
-            f"No workbook found. Upload one from the sidebar, or place a file "
-            f"named `{DEFAULT_PATH_COV}` next to `app.py`."
-        )
-        st.stop()
-
-    try:
-        sheets = load_workbook_cov(data_file)
-    except Exception as e:
-        st.error(f"Couldn't read the workbook: {e}")
-        st.stop()
-
-    price_history = sheets.get("price_history", pd.DataFrame())
-    if price_history.empty:
-        st.info("No `price_history` sheet found, or it's empty — nothing to show yet.")
-        st.stop()
 
     table = _price_movement_table(price_history)
     if table.empty:
@@ -289,3 +270,143 @@ def render_price_trend_view():
 
     st.subheader(f"{len(display)} product(s) with a recorded price change")
     st.dataframe(display, use_container_width=True, hide_index=True)
+
+
+def _search_price_history_by_name(price_history: pd.DataFrame, search_term: str) -> pd.DataFrame:
+    """Case-insensitive substring search on price_history's common_name
+    column — returns every matching ROW (every snapshot, not just the
+    latest), since building a trend line needs the full history, not
+    just a current value. Same search style as price_view.py's By
+    Chemical Name mode, applied here to price_history instead of the
+    master sheets."""
+    if price_history.empty or "common_name" not in price_history.columns or not search_term.strip():
+        return pd.DataFrame()
+    term = search_term.strip().lower()
+    mask = price_history["common_name"].astype(str).str.lower().str.contains(term, na=False, regex=False)
+    return price_history[mask].copy()
+
+
+def _render_price_trend_chart(price_history: pd.DataFrame):
+    st.caption(
+        "Search a chemical/active-ingredient name (e.g. 'copper', "
+        "'glyphosate') to see how its price has moved over time — one "
+        "line per product, so a company selling two different "
+        "formulations of the same chemical gets two separate lines "
+        "rather than one misleadingly averaged line. Shows the raw "
+        "listed price (฿ per package as recorded), not a per-rai/per-"
+        "20L cost — that stays comparable across categories with no "
+        "unit-mixing risk, unlike the derived cost metrics used "
+        "elsewhere in this app."
+    )
+    search_term = st.text_input(
+        "Search by chemical / common name", key="pt_chart_search",
+        placeholder="e.g. copper, glyphosate, mancozeb",
+    )
+    if not search_term.strip():
+        st.info("Type a chemical or active-ingredient name above to search.")
+        return
+
+    matches = _search_price_history_by_name(price_history, search_term)
+    if matches.empty:
+        st.info(f"No price history found matching '{search_term}'.")
+        return
+
+    # One identity per (product_id, category, company, trade_name) --
+    # category is part of the identity in case a product_id were ever
+    # reused across categories, same safeguard used elsewhere.
+    identity_cols = ["product_id", "category", "company", "trade_name", "common_name"]
+    missing_identity_cols = [c for c in identity_cols if c not in matches.columns]
+    if missing_identity_cols:
+        st.error(f"price_history is missing expected column(s): {', '.join(missing_identity_cols)}")
+        return
+    identities = matches[identity_cols].drop_duplicates().copy()
+    identities["label"] = identities.apply(
+        lambda r: f"{r['company']} — {r['trade_name']} ({r['common_name']}, {r['category']})", axis=1
+    )
+
+    default_labels = identities["label"].tolist()[:8]  # cap the first view so it isn't overcrowded by default
+    chosen_labels = st.multiselect(
+        "Products to plot", identities["label"].tolist(), default=default_labels, key="pt_chart_products",
+    )
+    if not chosen_labels:
+        st.info("Pick at least one product above to plot.")
+        return
+
+    fig = go.Figure()
+    plotted_any = False
+    for label in chosen_labels:
+        id_row = identities[identities["label"] == label].iloc[0]
+        rows = matches[
+            (matches["product_id"].astype(str).str.strip() == str(id_row["product_id"]).strip())
+            & (matches["category"] == id_row["category"])
+        ].copy()
+        rows["snapshot_date"] = pd.to_datetime(rows["snapshot_date"], errors="coerce", dayfirst=True)
+        rows["price"] = pd.to_numeric(rows["price"], errors="coerce")
+        rows = rows.dropna(subset=["snapshot_date", "price"]).sort_values("snapshot_date")
+        if rows.empty:
+            continue
+        plotted_any = True
+        fig.add_trace(go.Scatter(
+            x=rows["snapshot_date"], y=rows["price"], mode="lines+markers", name=label,
+        ))
+
+    if not plotted_any:
+        st.info("None of the selected products have usable price/date data to plot.")
+        return
+
+    fig.update_layout(
+        height=420,
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(title="Snapshot date"),
+        yaxis=dict(title="Price (฿ per package)"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("Raw snapshots for the plotted products"):
+        chosen_ids = {(str(identities[identities["label"] == l].iloc[0]["product_id"]).strip(),
+                       identities[identities["label"] == l].iloc[0]["category"]) for l in chosen_labels}
+        raw = matches[matches.apply(
+            lambda r: (str(r["product_id"]).strip(), r["category"]) in chosen_ids, axis=1
+        )].copy()
+        raw["snapshot_date"] = pd.to_datetime(raw["snapshot_date"], errors="coerce", dayfirst=True)
+        raw = raw.sort_values(["company", "trade_name", "snapshot_date"])
+        raw["price"] = raw["price"].apply(_format_price)
+        display_cols = [c for c in ["snapshot_date", "category", "company", "trade_name",
+                                     "common_name", "price"] if c in raw.columns]
+        st.dataframe(raw[display_cols], use_container_width=True, hide_index=True)
+
+
+def render_price_trend_view():
+    st.title("📈 Price Movement")
+
+    data_file = get_file_cov()
+    if data_file is None:
+        st.warning(
+            f"No workbook found. Upload one from the sidebar, or place a file "
+            f"named `{DEFAULT_PATH_COV}` next to `app.py`."
+        )
+        st.stop()
+
+    try:
+        sheets = load_workbook_cov(data_file)
+    except Exception as e:
+        st.error(f"Couldn't read the workbook: {e}")
+        st.stop()
+
+    price_history = sheets.get("price_history", pd.DataFrame())
+    if price_history.empty:
+        st.info("No `price_history` sheet found, or it's empty — nothing to show yet.")
+        st.stop()
+
+    mode = st.radio(
+        "View", ["Recent Changes", "Price Trend Chart"], horizontal=True, key="pm_mode",
+        help="Recent Changes: what moved since the last update round, per product. "
+             "Price Trend Chart: search a chemical and see its full price history as a line chart.",
+    )
+    st.divider()
+
+    if mode == "Recent Changes":
+        _render_recent_changes(sheets, price_history)
+    else:
+        _render_price_trend_chart(price_history)
