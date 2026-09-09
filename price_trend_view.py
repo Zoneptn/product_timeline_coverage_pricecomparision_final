@@ -417,6 +417,117 @@ def _render_price_trend_chart(sheets: dict, price_history: pd.DataFrame):
         st.dataframe(raw[display_cols], use_container_width=True, hide_index=True)
 
 
+def _stale_price_table(price_history: pd.DataFrame) -> pd.DataFrame:
+    """For every (product_id, category), finds the most recent snapshot
+    date and how many days have passed since then — measured against
+    TODAY, not against other products' dates, since a product could be
+    the most-recently-seen row in the sheet and still genuinely be
+    stale if nobody has actually priced it in over a year. Returns one
+    row per product, sorted most-stale (longest since update) first.
+    Callers apply their own day threshold to decide what counts as
+    'flagged' — this function just computes the raw days-since number
+    for every product, unfiltered."""
+    required = {"snapshot_date", "product_id", "category"}
+    empty_cols = ["category", "company", "trade_name", "common_name", "product_id",
+                  "last_updated", "days_since"]
+    if price_history.empty or not required.issubset(price_history.columns):
+        return pd.DataFrame(columns=empty_cols)
+
+    df = price_history.copy()
+    df["snapshot_date"] = pd.to_datetime(df["snapshot_date"], errors="coerce", dayfirst=True)
+    df["product_id"] = df["product_id"].astype(str).str.strip()
+    df["category"] = df["category"].astype(str).str.strip()
+    df = df.dropna(subset=["snapshot_date"])
+    if df.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    today = pd.Timestamp.today().normalize()
+    rows = []
+    for (pid, cat), g in df.groupby(["product_id", "category"]):
+        last_row = g.loc[g["snapshot_date"].idxmax()]
+        last_date = last_row["snapshot_date"]
+        rows.append({
+            "category": cat,
+            "company": last_row.get("company", ""),
+            "trade_name": last_row.get("trade_name", ""),
+            "common_name": last_row.get("common_name", ""),
+            "product_id": pid,
+            "last_updated": last_date,
+            "days_since": (today - last_date).days,
+        })
+    out = pd.DataFrame(rows, columns=empty_cols)
+    if out.empty:
+        return out
+    return out.sort_values("days_since", ascending=False).reset_index(drop=True)
+
+
+def _render_stale_prices(sheets: dict, price_history: pd.DataFrame):
+    st.caption(
+        "Products whose price hasn't been updated recently — catches "
+        "products that quietly fell out of an update round before that "
+        "becomes a real gap nobody notices until someone actually asks "
+        "for that number."
+    )
+
+    crop_choice, category_choice, stage_filter, crop_id, cfg = _crop_category_timing_selector(sheets, "pm_stale")
+
+    company_options = ["All"] + sorted(
+        price_history["company"].dropna().astype(str).str.strip().unique().tolist()
+    ) if "company" in price_history.columns else ["All"]
+    col_g, col_h = st.columns([2, 1])
+    with col_g:
+        company_choice = st.selectbox("Company", company_options, key="pm_stale_company")
+    with col_h:
+        threshold_choice = st.selectbox(
+            "Flag if no update in the last:", ["6 months", "1 year", "2 years"],
+            index=1, key="pm_stale_threshold",
+        )
+    threshold_days = {"6 months": 180, "1 year": 365, "2 years": 730}[threshold_choice]
+
+    st.markdown(
+        f"**Crop:** {crop_choice} &nbsp;|&nbsp; "
+        f"**Category:** {category_choice} &nbsp;|&nbsp; "
+        f"**Spray Timing:** {_spray_timing_display(category_choice, stage_filter)} &nbsp;|&nbsp; "
+        f"**Company:** {company_choice}"
+    )
+
+    table = _stale_price_table(price_history)
+    if table.empty:
+        st.info("No usable snapshot dates found in `price_history` yet.")
+        return
+
+    if category_choice != "All":
+        table = table[table["category"] == category_choice]
+    if crop_choice != "All" and category_choice != "All":
+        product_ids = _products_for_selection(sheets, cfg, crop_id, target_id=None, stage_filter=stage_filter)
+        table = table[table["product_id"].isin(product_ids)]
+    if company_choice != "All":
+        table = table[table["company"] == company_choice]
+
+    if table.empty:
+        st.info("No products match this selection.")
+        return
+
+    stale = table[table["days_since"] > threshold_days]
+    if stale.empty:
+        st.success(f"No products are stale by this threshold ({threshold_choice}) — "
+                   f"everything in this selection has been updated recently.")
+        return
+
+    display = stale.copy()
+    display["Last Updated"] = display["last_updated"].dt.strftime("%Y-%m-%d")
+    display["Days Since Update"] = display["days_since"]
+    display = display.rename(columns={
+        "category": "Category", "company": "Company",
+        "trade_name": "Trade Name", "common_name": "Common Name",
+    })
+    display = display[["Category", "Company", "Trade Name", "Common Name",
+                        "Last Updated", "Days Since Update"]]
+
+    st.subheader(f"⚠️ {len(display)} product(s) haven't been updated in over {threshold_choice}")
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+
 def render_price_trend_view():
     st.title("📈 Price Movement")
 
@@ -440,13 +551,16 @@ def render_price_trend_view():
         st.stop()
 
     mode = st.radio(
-        "View", ["Recent Changes", "Price Trend Chart"], horizontal=True, key="pm_mode",
+        "View", ["Recent Changes", "Price Trend Chart", "Stale Prices"], horizontal=True, key="pm_mode",
         help="Recent Changes: what moved since the last update round, per product. "
-             "Price Trend Chart: search a chemical and see its full price history as a line chart.",
+             "Price Trend Chart: pick products and see their full price history as a line chart. "
+             "Stale Prices: products with no recent price update, before that becomes a real gap.",
     )
     st.divider()
 
     if mode == "Recent Changes":
         _render_recent_changes(sheets, price_history)
-    else:
+    elif mode == "Price Trend Chart":
         _render_price_trend_chart(sheets, price_history)
+    else:
+        _render_stale_prices(sheets, price_history)
