@@ -195,11 +195,13 @@ def render_price_trend_view():
         if not stage_df_all.empty and "crop" in stage_df_all.columns else []
     crop_lookup = dict(zip(stage_df_all.get("crop", []), stage_df_all.get("crop_id", [])))
 
-    col_a, col_b = st.columns(2)
+    col_a, col_b, col_lang = st.columns([2, 2, 1])
     with col_a:
         crop_choice = st.selectbox("Crop", ["All"] + crop_names, key="pm_crop")
     with col_b:
         category_choice = st.selectbox("Category", CATEGORY_OPTIONS, key="pm_category")
+    with col_lang:
+        lang_choice = st.radio("Name language", ["English", "Thai"], horizontal=True, key="pm_lang")
 
     target_choice = "All"
     stage_filter = None
@@ -221,8 +223,13 @@ def render_price_trend_view():
             target_slot = st
 
         targets_df = _price_target_options(sheets, cfg, crop_id, stage_filter=stage_filter)
-        name_col = "name_en" if "name_en" in targets_df.columns else (
-            targets_df.columns[0] if not targets_df.empty else "name_en")
+        # Falls back to English if the Thai name column isn't present in
+        # this sheet yet (or vice versa) — same defensive pattern used
+        # everywhere else names are shown bilingually in this app.
+        preferred_col = "name_en" if lang_choice == "English" else "name_th"
+        name_col = preferred_col if preferred_col in targets_df.columns else (
+            "name_en" if "name_en" in targets_df.columns else (
+                targets_df.columns[0] if not targets_df.empty else "name_en"))
         target_options = targets_df[name_col].dropna().astype(str).tolist() if not targets_df.empty else []
         target_name_to_id = dict(zip(targets_df.get(name_col, []), targets_df.get(cfg["target_id_col"], [])))
 
