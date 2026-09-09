@@ -605,33 +605,55 @@ def _render_by_target(sheets: dict, highlight_companies: list):
         st.stop()
 
     target_name_to_id = dict(zip(targets[name_col], targets[cfg["target_id_col"]]))
+    target_options_list = list(target_name_to_id.keys())
+    # Defaults to everything if there are 10 or fewer targets (so the
+    # common case still shows "all of them" out of the box), otherwise
+    # starts empty and requires an explicit pick — max_selections=10
+    # keeps a comparison table from growing unmanageably wide/long.
+    default_targets = target_options_list if len(target_options_list) <= 10 else []
     col4, col5 = st.columns([3, 1])
     with col4:
-        target_choice = st.selectbox(
-            f"{category_choice.split(' ')[0]} target", ["All"] + list(target_name_to_id.keys()), key="price_target"
+        target_choices = st.multiselect(
+            f"{category_choice.split(' ')[0]} target(s) — pick up to 10",
+            target_options_list, default=default_targets, max_selections=10, key="price_target",
         )
     with col5:
         sort_choice = st.radio("Sort", ["Cheapest first", "Priciest first"],
                                 horizontal=True, key="price_sort")
     ascending = (sort_choice == "Cheapest first")
 
-    # Scope the price lookup to the currently selected Spray Timing —
-    # None (no restriction) when "All" is chosen, or the exact ws_id
-    # window(s) for a specific timing otherwise. Without this, "All"
-    # and any single timing would silently return identical results,
-    # since the underlying junction lookup ignores timing unless told
-    # which windows to restrict to.
-    if target_choice == "All":
-        # One combined table across every target for this crop/category
-        # (/timing) — each target's own scoped price lookup,
-        # concatenated with a Target column so rows stay identifiable.
-        # Sorted by target name FIRST (grouped), then cost within each
-        # target — flat cost-only sorting across DIFFERENT targets
-        # wouldn't mean much (cheapest glyphosate vs. cheapest
-        # fungicide aren't comparable), so grouping takes priority,
-        # same principle already used for Spray Timing grouping.
+    if not target_choices:
+        st.info("Pick at least one target above to see the comparison.")
+        st.stop()
+
+    # Scope each target's price lookup to the currently selected Spray
+    # Timing — None (no restriction) when "All" is chosen, or the exact
+    # ws_id window(s) for a specific timing otherwise. Without this,
+    # "All" and any single timing would silently return identical
+    # results, since the underlying junction lookup ignores timing
+    # unless told which windows to restrict to.
+    if len(target_choices) == 1:
+        # Single target: unchanged from before — no Target column, since
+        # the subheader already names the one target being shown.
+        target_id = target_name_to_id[target_choices[0]]
+        ws_ids = _target_ws_ids(sheets, cfg, crop_id, target_id, stage_filter)
+        table = _price_comparison_table(sheets, cfg, crop_id, target_id, ascending=ascending, ws_ids=ws_ids)
+        if table.empty:
+            st.info(f"No products found across any company for {target_choices[0]}.")
+            st.stop()
+        show_target_col = False
+    else:
+        # Multiple targets: one combined table, each target's own
+        # scoped price lookup concatenated with a Target column so rows
+        # stay identifiable. Sorted by target name FIRST (grouped),
+        # then cost within each target — flat cost-only sorting across
+        # DIFFERENT targets wouldn't mean much (cheapest glyphosate vs.
+        # cheapest fungicide aren't comparable), so grouping takes
+        # priority, same principle already used for Spray Timing
+        # grouping.
         pieces = []
-        for tname, tid in target_name_to_id.items():
+        for tname in target_choices:
+            tid = target_name_to_id[tname]
             ws_ids = _target_ws_ids(sheets, cfg, crop_id, tid, stage_filter)
             t = _price_comparison_table(sheets, cfg, crop_id, tid, ascending=ascending, ws_ids=ws_ids)
             if t.empty:
@@ -640,20 +662,14 @@ def _render_by_target(sheets: dict, highlight_companies: list):
             t["target_name"] = tname
             pieces.append(t)
         if not pieces:
-            st.info("No products found across any company for any target in this selection.")
+            st.info("No products found across any company for the selected targets.")
             st.stop()
         table = pd.concat(pieces, ignore_index=True)
         table["_sort_cost"] = pd.to_numeric(table[cfg["cost_col"]], errors="coerce")
         table = table.sort_values(
             ["target_name", "_sort_cost"], ascending=[True, ascending], na_position="last"
         ).drop(columns=["_sort_cost"]).reset_index(drop=True)
-    else:
-        target_id = target_name_to_id[target_choice]
-        ws_ids = _target_ws_ids(sheets, cfg, crop_id, target_id, stage_filter)
-        table = _price_comparison_table(sheets, cfg, crop_id, target_id, ascending=ascending, ws_ids=ws_ids)
-        if table.empty:
-            st.info(f"No products found across any company for {target_choice}.")
-            st.stop()
+        show_target_col = True
 
     # Minimum Efficiency filter — lets weak products be excluded from
     # the price comparison entirely, rather than sitting in the table
@@ -703,7 +719,7 @@ def _render_by_target(sheets: dict, highlight_companies: list):
         table = table[table["tier"].isin(tier_thresholds[min_tier_choice])]
 
     if table.empty:
-        st.info(f"No products meet these filters for {target_choice}.")
+        st.info("No products meet these filters for the selected target(s).")
         st.stop()
 
     display = table.drop(columns=["best_efficiency"]).copy()
@@ -719,16 +735,17 @@ def _render_by_target(sheets: dict, highlight_companies: list):
     })
 
     # Explicit column order rather than whatever order columns happen
-    # to end up in — Target (when present, "All" mode only) goes first
-    # so it reads naturally as "grouped by this", ahead of the
-    # per-product details.
+    # to end up in — Target (when present, multi-target selections
+    # only) goes first so it reads naturally as "grouped by this",
+    # ahead of the per-product details.
     base_cols = ["Company", "Trade Name", "Common Name", "Tier", "Efficiency", "Price", "Size", "Usage"]
     if "Spray Timing" in display.columns:
         base_cols.append("Spray Timing")
     base_cols.append(cfg["cost_col"].replace("_", " ").title())
-    display = display[(["Target"] if target_choice == "All" else []) + base_cols]
+    display = display[(["Target"] if show_target_col else []) + base_cols]
 
-    st.subheader(f"{target_choice} — {len(display)} product(s) across {display['Company'].nunique()} company(ies)")
+    header_label = target_choices[0] if len(target_choices) == 1 else f"{len(target_choices)} targets"
+    st.subheader(f"{header_label} — {len(display)} product(s) across {display['Company'].nunique()} company(ies)")
     st.dataframe(_highlight_companies(display, "Company", highlight_companies),
                  use_container_width=True, hide_index=True)
 
