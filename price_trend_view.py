@@ -125,16 +125,28 @@ def render_price_trend_view():
                  "check back after the next update round.")
         st.stop()
 
-    col1, col2 = st.columns([2, 1])
+    # Company options come from every company with at least one recorded
+    # price change (the unfiltered `table`), not from `filtered` — kept
+    # independent of the Category/Direction picks below, same as
+    # Category itself doesn't narrow based on Direction. Cascading
+    # filters (where one dropdown's options shift based on another)
+    # would be more surprising here than useful.
+    company_options = ["All"] + sorted(table["company"].dropna().astype(str).str.strip().unique().tolist())
+
+    col1, col2, col3 = st.columns([2, 2, 1])
     with col1:
         category_choice = st.selectbox("Category", CATEGORY_OPTIONS, key="pm_category")
     with col2:
+        company_choice = st.selectbox("Company", company_options, key="pm_company")
+    with col3:
         direction_choice = st.radio("Direction", ["All", "Increases only", "Decreases only"],
                                      horizontal=True, key="pm_direction")
 
     filtered = table.copy()
     if category_choice != "All":
         filtered = filtered[filtered["category"] == category_choice]
+    if company_choice != "All":
+        filtered = filtered[filtered["company"] == company_choice]
     if direction_choice == "Increases only":
         filtered = filtered[filtered["change"] > 0]
     elif direction_choice == "Decreases only":
