@@ -289,27 +289,11 @@ def _render_recent_changes(sheets: dict, price_history: pd.DataFrame):
     st.dataframe(display, use_container_width=True, hide_index=True)
 
 
-def _search_price_history_by_name(price_history: pd.DataFrame, search_term: str) -> pd.DataFrame:
-    """Case-insensitive substring search on price_history's common_name
-    column — returns every matching ROW (every snapshot, not just the
-    latest), since building a trend line needs the full history, not
-    just a current value. Same search style as price_view.py's By
-    Chemical Name mode, applied here to price_history instead of the
-    master sheets."""
-    if price_history.empty or "common_name" not in price_history.columns or not search_term.strip():
-        return pd.DataFrame()
-    term = search_term.strip().lower()
-    mask = price_history["common_name"].astype(str).str.lower().str.contains(term, na=False, regex=False)
-    return price_history[mask].copy()
-
-
 def _render_price_trend_chart(sheets: dict, price_history: pd.DataFrame):
     st.caption(
-        "Search a chemical/active-ingredient name (e.g. 'copper', "
-        "'glyphosate') to see how its price has moved over time — one "
-        "line per product, so a company selling two different "
-        "formulations of the same chemical gets two separate lines "
-        "rather than one misleadingly averaged line. Shows the raw "
+        "Pick a crop, category, and target pest/weed/disease to narrow "
+        "down to relevant products, then choose which ones to compare "
+        "on the chart below — add as many as you like. Shows the raw "
         "listed price (฿ per package as recorded), not a per-rai/per-"
         "20L cost — that stays comparable across categories with no "
         "unit-mixing risk, unlike the derived cost metrics used "
@@ -317,6 +301,22 @@ def _render_price_trend_chart(sheets: dict, price_history: pd.DataFrame):
     )
 
     crop_choice, category_choice, stage_filter, crop_id, cfg = _crop_category_timing_selector(sheets, "pt_chart")
+
+    target_choice = "All"
+    target_name_to_id = {}
+    if crop_choice != "All" and category_choice != "All":
+        lang_choice = st.radio("Name language", ["English", "Thai"], horizontal=True, key="pt_chart_lang")
+        targets_df = _price_target_options(sheets, cfg, crop_id, stage_filter=stage_filter)
+        # Falls back to English if the Thai name column isn't present in
+        # this sheet yet (or vice versa) — same defensive pattern used
+        # everywhere else names are shown bilingually in this app.
+        preferred_col = "name_en" if lang_choice == "English" else "name_th"
+        name_col = preferred_col if preferred_col in targets_df.columns else (
+            "name_en" if "name_en" in targets_df.columns else (
+                targets_df.columns[0] if not targets_df.empty else "name_en"))
+        target_options = targets_df[name_col].dropna().astype(str).tolist() if not targets_df.empty else []
+        target_name_to_id = dict(zip(targets_df.get(name_col, []), targets_df.get(cfg["target_id_col"], [])))
+        target_choice = st.selectbox("Target (pest/weed/disease)", ["All"] + target_options, key="pt_chart_target")
 
     company_options_all = ["All"] + sorted(
         price_history["company"].dropna().astype(str).str.strip().unique().tolist()
@@ -327,38 +327,28 @@ def _render_price_trend_chart(sheets: dict, price_history: pd.DataFrame):
         f"**Crop:** {crop_choice} &nbsp;|&nbsp; "
         f"**Category:** {category_choice} &nbsp;|&nbsp; "
         f"**Spray Timing:** {_spray_timing_display(category_choice, stage_filter)} &nbsp;|&nbsp; "
+        f"**Target:** {target_choice} &nbsp;|&nbsp; "
         f"**Company:** {company_choice}"
     )
 
-    search_term = st.text_input(
-        "Search by chemical / common name", key="pt_chart_search",
-        placeholder="e.g. copper, glyphosate, mancozeb",
-    )
-    if not search_term.strip():
-        st.info("Type a chemical or active-ingredient name above to search.")
-        return
-
-    matches = _search_price_history_by_name(price_history, search_term)
-    if matches.empty:
-        st.info(f"No price history found matching '{search_term}'.")
-        return
-
-    # Crop/Category/Timing/Company narrow the search results further —
-    # combined as AND conditions with the chemical-name search above.
-    # Crop/Timing require the same junction-sheet cross-reference used
-    # in Recent Changes (price_history has no crop/pest linkage of its
-    # own); Category/Company are simple column filters on price_history
-    # itself.
+    # Derives the actual list of products to choose from, rather than
+    # requiring a typed chemical name — Crop/Category/Timing/Target/
+    # Company all narrow this down together. Left entirely at "All",
+    # this shows every product in price_history, same as no filtering
+    # at all (the multiselect below still supports typing to filter
+    # its own option list, so a long list stays navigable).
+    matches = price_history.copy()
     if category_choice != "All":
         matches = matches[matches["category"] == category_choice]
     if crop_choice != "All" and category_choice != "All":
-        product_ids = _products_for_selection(sheets, cfg, crop_id, target_id=None, stage_filter=stage_filter)
+        target_id = target_name_to_id.get(target_choice) if target_choice != "All" else None
+        product_ids = _products_for_selection(sheets, cfg, crop_id, target_id=target_id, stage_filter=stage_filter)
         matches = matches[matches["product_id"].astype(str).str.strip().isin(product_ids)]
     if company_choice != "All":
         matches = matches[matches["company"] == company_choice]
 
     if matches.empty:
-        st.info(f"No price history matches '{search_term}' with these filters.")
+        st.info("No products match this selection yet.")
         return
 
     # One identity per (product_id, category, company, trade_name) --
@@ -374,9 +364,9 @@ def _render_price_trend_chart(sheets: dict, price_history: pd.DataFrame):
         lambda r: f"{r['company']} — {r['trade_name']} ({r['common_name']}, {r['category']})", axis=1
     )
 
-    default_labels = identities["label"].tolist()[:8]  # cap the first view so it isn't overcrowded by default
     chosen_labels = st.multiselect(
-        "Products to plot", identities["label"].tolist(), default=default_labels, key="pt_chart_products",
+        "Products to compare (add as many as you like)",
+        sorted(identities["label"].tolist()), key="pt_chart_products",
     )
     if not chosen_labels:
         st.info("Pick at least one product above to plot.")
