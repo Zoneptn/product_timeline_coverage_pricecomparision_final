@@ -36,7 +36,7 @@ from coverage_view import render_coverage_view
 from price_view import render_price_comparison_view
 from price_trend_view import render_price_trend_view
 
-st.set_page_config(page_title="SAC Crop Dashboard", layout="wide")
+st.set_page_config(page_title="Crop Dashboard", layout="wide")
 
 st.sidebar.subheader("View")
 view = st.sidebar.radio(
